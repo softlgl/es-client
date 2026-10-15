@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>es-client — ES 数据浏览与导出</title>
+  <link rel="stylesheet" href="/css/style.css?v=13">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">es-client</div>
+    <div class="conn-dropdown hidden" id="conn-dropdown">
+      <span id="conn-label"></span>
+      <div id="conn-menu" class="conn-menu hidden"></div>
+    </div>
+    <span class="conn-info" id="conn-info"></span>
+  </header>
+  <div class="layout">
+    <aside id="sidebar" class="hidden"></aside>
+    <div id="sb-resizer" class="sb-resizer hidden" title="拖拽调整宽度"></div>
+    <main id="view"></main>
+  </div>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <script type="module" src="/js/app.js?v=13"></script>
+</body>
+</html>

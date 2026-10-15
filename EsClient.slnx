@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EsClient.Api/EsClient.Api.csproj" />
+    <Project Path="src/Seeder/Seeder.csproj" />
+  </Folder>
+</Solution>

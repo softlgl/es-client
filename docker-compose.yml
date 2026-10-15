@@ -1,0 +1,19 @@
+services:
+  es8:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.3
+    container_name: es-client-es8
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+
+  es7:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+    container_name: es-client-es7
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9201:9200"
