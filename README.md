@@ -73,7 +73,7 @@ dotnet run --project src/Seeder -- --host http://localhost:9200 --count 120000
 - `connections.json`：ES 连接（含用户名/密码）
 - `ai-settings.json`：AI 模型配置（含 ApiKey）
 
-> ⚠️ 该目录包含明文凭据，已被 `.gitignore` 排除，请勿提交到版本库或分享给他人。
+> ⚠️ 该目录包含明文凭据，请勿分享给他人。
 
 ## 项目结构
 
