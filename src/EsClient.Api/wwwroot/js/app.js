@@ -166,7 +166,7 @@ let showSystem = localStorage.getItem('show-system') === '1';
 async function refreshSidebar(activeIndex) {
   const sb = document.getElementById('sidebar');
   if (sb && !sb.classList.contains('hidden'))
-    sb.innerHTML = '<div class="sb-status">索引加载中…</div>';
+    sb.innerHTML = '<div class="sb-status"><span class="spinner"></span>索引加载中…</div>';
   try {
     sidebarItems = await get('/api/indices');
     sidebarLoaded = true;

@@ -327,9 +327,21 @@ export async function renderBrowse(view, index) {
   }
 
   // ---------- 数据加载 ----------
+  let loading = false; // 请求进行中标志：防止并发查询导致旧响应覆盖新结果
+  function setBusy(busy) {
+    const run = $('#btn-run');
+    if (!run) return;
+    run.disabled = busy;
+    run.textContent = busy ? '查询中…' : '查询';
+    $('#btn-reset').disabled = busy;
+    $('#pager').querySelectorAll('button').forEach(b => { b.disabled = busy; });
+  }
   async function load() {
+    if (loading) return;
+    loading = true;
+    setBusy(true);
     const wrap = $('#table-wrap');
-    wrap.innerHTML = '<div class="empty-hint">加载中…</div>';
+    wrap.innerHTML = '<div class="empty-hint"><span class="spinner"></span>查询中…</div>';
     const start = state.history[state.history.length - 1];
     let body;
     try {
@@ -345,6 +357,8 @@ export async function renderBrowse(view, index) {
       wrap.innerHTML = `<div class="empty-hint">${escapeHtml(e.message)}</div>`;
       $('#pager').innerHTML = '';
       toast(e.message, true);
+      loading = false;
+      setBusy(false);
       return;
     }
     try {
@@ -357,6 +371,9 @@ export async function renderBrowse(view, index) {
       wrap.innerHTML = `<div class="empty-hint">加载失败：${escapeHtml(e.message)}</div>`;
       $('#pager').innerHTML = '';
       toast(e.message, true);
+    } finally {
+      loading = false;
+      setBusy(false);
     }
   }
 
@@ -442,16 +459,22 @@ export async function renderBrowse(view, index) {
       return;
     }
     const orig = JSON.stringify(json._source ?? json, null, 2);
+    const full = JSON.stringify(json, null, 2);
     showModal(`文档 ${id}`, `
-      <pre id="doc-view">${escapeHtml(JSON.stringify(json, null, 2))}</pre>
+      <pre id="doc-view">${escapeHtml(full)}</pre>
       <textarea class="doc-editor hidden" id="doc-editor" spellcheck="false"></textarea>
       <div class="doc-actions">
         <button class="btn btn-danger" id="doc-del">删除</button>
         <span style="flex:1"></span>
         <button class="btn hidden" id="doc-cancel">取消</button>
         <button class="btn btn-primary hidden" id="doc-save">保存</button>
+        <button class="btn" id="doc-copy">复制</button>
         <button class="btn" id="doc-edit">编辑</button>
       </div>`);
+    modalRoot.querySelector('#doc-copy').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(full).catch(() => {});
+      toast('已复制到剪贴板');
+    });
     const view = modalRoot.querySelector('#doc-view');
     const editor = modalRoot.querySelector('#doc-editor');
     const btnEdit = modalRoot.querySelector('#doc-edit');

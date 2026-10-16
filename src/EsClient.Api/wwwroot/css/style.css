@@ -348,6 +348,14 @@ table.data td .cell-json { color: #8b5cf6; font-family: Consolas, monospace; fon
 table.data td .cell-long { cursor: pointer; text-decoration: underline dotted; }
 table.data td._id-cell { color: var(--muted); font-family: Consolas, monospace; font-size: 12px; }
 .empty-hint { padding: 40px; text-align: center; color: var(--muted); }
+/* 查询加载中：转圈动画 */
+.spinner {
+  display: inline-block; width: 14px; height: 14px; margin-right: 8px;
+  border: 2px solid var(--border); border-top-color: var(--primary);
+  border-radius: 50%; vertical-align: -2px;
+  animation: spinner-rot .7s linear infinite;
+}
+@keyframes spinner-rot { to { transform: rotate(360deg); } }
 
 .pagination {
   display: flex; align-items: center; gap: 8px;
