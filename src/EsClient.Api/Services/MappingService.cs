@@ -20,7 +20,21 @@ public record ColumnMeta(string Path, string Type, bool Sortable, string? Keywor
 /// <summary>索引元数据。</summary>
 public record IndexMeta(
     string Index, string Status, string Health, long DocsCount,
-    int MaxResultWindow, List<ColumnMeta> Columns, List<string> NestedPaths);
+    int MaxResultWindow, List<ColumnMeta> Columns, List<string> NestedPaths)
+{
+    /// <summary>
+    /// 字段所处的最深层 nested 路径；非 nested 字段返回 null。
+    /// 「是否嵌套」与「用哪个 path 包裹」本是同一个判断，此前在 AI 生成、AI 问答、
+    /// 聚合下钻、字段采样四处各写了一遍 LINQ，改一处漏三处的典型位置。
+    /// </summary>
+    public string? ResolveNestedPath(string path) =>
+        NestedPaths.Where(p => path == p || path.StartsWith(p + "."))
+            .OrderByDescending(p => p.Length)
+            .FirstOrDefault();
+
+    /// <summary>字段是否位于 nested 路径下。</summary>
+    public bool IsNested(string path) => ResolveNestedPath(path) != null;
+}
 
 /// <summary>mapping → 扁平列定义（递归 properties，深度上限 8）。</summary>
 public class MappingService

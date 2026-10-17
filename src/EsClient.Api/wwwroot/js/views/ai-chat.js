@@ -1,5 +1,6 @@
 import { get, post, del, toast, fmtNum } from '../api.js?v=14';
-import { escapeHtml } from './indices.js?v=14';
+import { escapeHtml, highlightJson } from '../ui.js?v=14';
+import { streamSse } from '../sse.js?v=14';
 import { getBrowseQueryContext } from './browse.js?v=14';
 
 // 桶值下钻用的 term 查询构造：字段位于 nested 路径下时必须用 nested 包裹，
@@ -173,29 +174,6 @@ export async function renderAiChat(view, index) {
   document.addEventListener('click', e => {
     if (!sessDd.contains(e.target)) closeSessMenu();
   });
-
-  // 轻量 JSON 高亮（与 ai-dialog 保持一致，片段先转义再拼接）
-  function highlightJson(text) {
-    const esc = s => s.replace(/[&<>"']/g, c =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    const re = /("(?:\\.|[^"\\])*")(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
-    let out = '', last = 0, m;
-    while ((m = re.exec(text)) !== null) {
-      out += esc(text.slice(last, m.index));
-      if (m[1] !== undefined) {
-        out += m[2] !== undefined
-          ? `<span class="j-key">${esc(m[1])}</span>${esc(m[2])}`
-          : `<span class="j-str">${esc(m[1])}</span>`;
-      } else if (m[0] === 'true' || m[0] === 'false' || m[0] === 'null') {
-        out += `<span class="j-kw">${m[0]}</span>`;
-      } else {
-        out += `<span class="j-num">${esc(m[0])}</span>`;
-      }
-      last = re.lastIndex;
-    }
-    out += esc(text.slice(last));
-    return out;
-  }
 
   function dataTableHtml(data) {
     if (!data || !Array.isArray(data.rows) || data.rows.length === 0) return '';
@@ -381,80 +359,55 @@ export async function renderAiChat(view, index) {
     };
 
     try {
-      const res = await fetch(`/api/ai/chat/${encodeURIComponent(index)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId, question, thinking: thinkCb.checked, timeZone,
-          currentQuery: browseContext
-        }),
-        signal: abortCtl.signal
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        fail(err.error || `请求失败（${res.status}）`);
-        return;
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      let finished = false;
-      while (!finished) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) >= 0) {
-          const raw = buf.slice(0, idx).trim();
-          buf = buf.slice(idx + 2);
-          if (!raw.startsWith('data:')) continue;
-          let ev;
-          try { ev = JSON.parse(raw.slice(5)); } catch { continue; }
-
-          if (ev.type === 'status') {
-            statusEl.innerHTML = `<span class="spinner"></span>${escapeHtml(ev.text || '')}`;
-          } else if (ev.type === 'reasoning') {
-            if (!reasoningShown) { reasonEl.classList.remove('hidden'); reasoningShown = true; }
-            reasonEl.textContent += ev.text || '';
-            reasonEl.scrollTop = reasonEl.scrollHeight;
-            autoScroll();
-          } else if (ev.type === 'content' && !dslText) {
-            // 第一阶段：DSL 生成预览
-            genEl.classList.remove('hidden');
-            genEl.textContent += ev.text || '';
-            autoScroll();
-          } else if (ev.type === 'dsl') {
-            dslText = JSON.stringify(ev.dsl, null, 2);
-            genEl.remove();
-            statusEl.innerHTML = '<span class="spinner"></span>正在执行查询…';
-          } else if (ev.type === 'data') {
-            data = ev;
-            dataEl.innerHTML = dataTableHtml(ev);
-            autoScroll();
-          } else if (ev.type === 'content') {
-            statusEl.remove();
-            answerEl.classList.remove('hidden');
-            answer += ev.text || '';
-            answerEl.textContent = answer;
-            autoScroll();
-          } else if (ev.type === 'done') {
-            finished = true;
-            const isNew = sessionId !== ev.sessionId;
-            sessionId = ev.sessionId;
-            turns.push({ role: 'assistant', text: ev.turn.text, dsl: ev.turn.dsl, data: ev.turn.data });
-            await loadSessions();
-            drawSessLabel();
-            live.remove();
-            drawMsgs();
-            if (isNew) toast('已创建新会话');
-            finish();
-          } else if (ev.type === 'error') {
-            finished = true;
-            fail(ev.error || '问答失败');
-          }
+      // onEvent 返回 false 表示已收尾（收到 done/error）
+      const settled = await streamSse(`/api/ai/chat/${encodeURIComponent(index)}`, {
+        sessionId, question, thinking: thinkCb.checked, timeZone,
+        currentQuery: browseContext
+      }, abortCtl.signal, async ev => {
+        if (ev.type === 'status') {
+          statusEl.innerHTML = `<span class="spinner"></span>${escapeHtml(ev.text || '')}`;
+        } else if (ev.type === 'reasoning') {
+          if (!reasoningShown) { reasonEl.classList.remove('hidden'); reasoningShown = true; }
+          reasonEl.textContent += ev.text || '';
+          reasonEl.scrollTop = reasonEl.scrollHeight;
+          autoScroll();
+        } else if (ev.type === 'content' && !dslText) {
+          // 第一阶段：DSL 生成预览
+          genEl.classList.remove('hidden');
+          genEl.textContent += ev.text || '';
+          autoScroll();
+        } else if (ev.type === 'dsl') {
+          dslText = JSON.stringify(ev.dsl, null, 2);
+          genEl.remove();
+          statusEl.innerHTML = '<span class="spinner"></span>正在执行查询…';
+        } else if (ev.type === 'data') {
+          data = ev;
+          dataEl.innerHTML = dataTableHtml(ev);
+          autoScroll();
+        } else if (ev.type === 'content') {
+          statusEl.remove();
+          answerEl.classList.remove('hidden');
+          answer += ev.text || '';
+          answerEl.textContent = answer;
+          autoScroll();
+        } else if (ev.type === 'done') {
+          const isNew = sessionId !== ev.sessionId;
+          sessionId = ev.sessionId;
+          turns.push({ role: 'assistant', text: ev.turn.text, dsl: ev.turn.dsl, data: ev.turn.data });
+          await loadSessions();
+          drawSessLabel();
+          live.remove();
+          drawMsgs();
+          if (isNew) toast('已创建新会话');
+          finish();
+          return false;
+        } else if (ev.type === 'error') {
+          fail(ev.error || '问答失败');
+          return false;
         }
-      }
-      if (!finished) {
+      });
+      // true = 流自然结束却未收到 done/error
+      if (settled) {
         if (answer.trim()) {
           // 流被意外截断但已有部分回答：保留为最终回答（服务端可能已落库，此处仅展示）
           turns.push({ role: 'assistant', text: answer, dsl: dslText, data });

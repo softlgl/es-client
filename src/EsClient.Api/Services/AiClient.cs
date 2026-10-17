@@ -109,8 +109,7 @@ public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai)
         {
             // nested 路径下的字段不能在本层聚合里采：根级 terms/stats 看不到嵌套文档的值，
             // 采出来必然是空，白白占用下方有限的名额，故直接排除（其示例值由 nested 聚合另行提供）
-            bool IsNested(ColumnMeta c) =>
-                meta.NestedPaths.Any(p => c.Path == p || c.Path.StartsWith(p + "."));
+            bool IsNested(ColumnMeta c) => meta.IsNested(c.Path);
 
             var fields = meta.Columns
                 .Where(c => !IsNested(c) && (c.Type is "keyword" or "ip" or "version" ||

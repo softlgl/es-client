@@ -152,10 +152,16 @@ public class AiSettingsStore
         return active;
     }
 
+    /// <summary>
+    /// 写盘走「临时文件 + 原子替换」，与 ConnectionStore/ChatStore 保持一致。
+    /// 直接覆盖目标文件时若进程中途被杀，文件会被截断，下次启动时 Load 的兜底
+    /// catch 会把整份配置当作未配置处理 —— 表现为「密钥莫名消失」且没有任何线索。
+    /// </summary>
     private void PersistNoLock()
     {
-        var json = JsonSerializer.Serialize(_file, JsonOpts);
-        File.WriteAllText(_filePath, json);
+        var tmp = _filePath + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(_file, JsonOpts));
+        File.Move(tmp, _filePath, overwrite: true);
     }
 
     private void Load()

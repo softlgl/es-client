@@ -1,5 +1,5 @@
 import { del, toast, fmtNum } from '../api.js?v=14';
-import { showModal, closeAllModals, modalRoot } from './browse.js?v=14';
+import { showModal, closeAllModals, modalRoot, escapeHtml } from '../ui.js?v=14';
 
 // 删除索引确认窗（概览页与侧栏复用）；onDeleted 在删除成功后回调
 export function confirmDeleteIndex(name, docsCount, onDeleted) {
@@ -43,9 +43,4 @@ export function renderIndices(view) {
       <h1>选择索引开始浏览</h1>
       <div class="sub">索引列表在左侧栏：点击切换，悬停可删除，顶部支持过滤与刷新。</div>
     </div>`;
-}
-
-export function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }

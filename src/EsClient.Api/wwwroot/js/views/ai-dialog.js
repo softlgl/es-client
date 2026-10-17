@@ -1,6 +1,6 @@
 import { get, post, toast } from '../api.js?v=14';
-import { escapeHtml } from './indices.js?v=14';
-import { showModal, closeAllModals, modalRoot } from './browse.js?v=14';
+import { escapeHtml, showModal, closeAllModals, modalRoot, highlightJson } from '../ui.js?v=14';
+import { streamSse } from '../sse.js?v=14';
 import { openAiSettingsDialog } from './ai-settings.js?v=14';
 
 // ---------- AI 生成查询弹窗：自然语言 → DSL → 填入查询语句框（DSL 模式） ----------
@@ -70,29 +70,6 @@ function renderDialog(index, applyDsl, s) {
   thinkCb.checked = localStorage.getItem('ai-thinking') !== '0';
   thinkCb.addEventListener('change', () =>
     localStorage.setItem('ai-thinking', thinkCb.checked ? '1' : '0'));
-
-  // 轻量 JSON 高亮（不依赖外部库），所有片段均先转义再拼接
-  function highlightJson(text) {
-    const esc = s => s.replace(/[&<>"']/g, c =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    const re = /("(?:\\.|[^"\\])*")(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
-    let out = '', last = 0, m;
-    while ((m = re.exec(text)) !== null) {
-      out += esc(text.slice(last, m.index));
-      if (m[1] !== undefined) {
-        out += m[2] !== undefined
-          ? `<span class="j-key">${esc(m[1])}</span>${esc(m[2])}`
-          : `<span class="j-str">${esc(m[1])}</span>`;
-      } else if (m[0] === 'true' || m[0] === 'false' || m[0] === 'null') {
-        out += `<span class="j-kw">${m[0]}</span>`;
-      } else {
-        out += `<span class="j-num">${esc(m[0])}</span>`;
-      }
-      last = re.lastIndex;
-    }
-    out += esc(text.slice(last));
-    return out;
-  }
 
   const initPlaceholder = input.placeholder;
 
@@ -211,69 +188,45 @@ function renderDialog(index, applyDsl, s) {
     };
 
     try {
-      const res = await fetch('/api/ai/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          index, prompt, history, thinking: thinkCb.checked,
-          timeZone, lastError: opts.lastError || null
-        }),
-        signal: abortCtl.signal
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        fail(err.error || `请求失败（${res.status}）`);
-        return;
-      }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      let finished = false;
-      while (!finished) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) >= 0) {
-          const raw = buf.slice(0, idx).trim();
-          buf = buf.slice(idx + 2);
-          if (!raw.startsWith('data:')) continue;
-          let ev;
-          try { ev = JSON.parse(raw.slice(5)); } catch { continue; }
-          if (ev.type === 'reasoning') { reasoningStr += ev.text || ''; appendReasoning(ev.text || ''); }
-          else if (ev.type === 'content') { contentStr += ev.text || ''; appendContent(ev.text || ''); }
-          else if (ev.type === 'done') {
-            finished = true;
-            input.value = '';
-            const dslText = JSON.stringify(ev.dsl, null, 2);
-            history.push({ role: 'user', content: prompt });
-            history.push({ role: 'assistant', content: JSON.stringify(ev.dsl) });
-            const turn = { prompt, dslText, reasoning: reasoningStr };
-            turns.push(turn);
-            finish();
-            drawTurns();
-            // 试运行：统计命中数，帮助用户判断生成方向是否正确
-            post('/api/ai/count', { index, dsl: ev.dsl })
-              .then(r => { turn.hits = r.total; drawTurns(); })
-              .catch(e => {
-                turn.countError = e.message || '试运行失败';
-                drawTurns();
-                // ES 的真实报错（字段不存在、类型不匹配、nested path 写错…）是最准确的自愈素材，
-                // 回喂给模型重生成一次；healed 置位避免与生成阶段的解析自愈叠加成无限重试
-                status.innerHTML = '<span style="color:#d97706">查询执行失败，正在把错误反馈给模型自动重试…</span>';
-                setTimeout(() => generate({
-                  prompt,
-                  lastError: `生成的 DSL 在 Elasticsearch 上执行失败，错误信息：${turn.countError}。请修正后重新输出，仍须遵守全部规则。`,
-                  healed: true
-                }), 300);
-              });
-          } else if (ev.type === 'error') {
-            finished = true;
-            fail(ev.error || '生成失败');
-          }
+      // onEvent 返回 false 表示已收尾（收到 done/error）
+      const settled = await streamSse('/api/ai/generate', {
+        index, prompt, history, thinking: thinkCb.checked,
+        timeZone, lastError: opts.lastError || null
+      }, abortCtl.signal, ev => {
+        if (ev.type === 'reasoning') { reasoningStr += ev.text || ''; appendReasoning(ev.text || ''); }
+        else if (ev.type === 'content') { contentStr += ev.text || ''; appendContent(ev.text || ''); }
+        else if (ev.type === 'done') {
+          input.value = '';
+          const dslText = JSON.stringify(ev.dsl, null, 2);
+          history.push({ role: 'user', content: prompt });
+          history.push({ role: 'assistant', content: JSON.stringify(ev.dsl) });
+          const turn = { prompt, dslText, reasoning: reasoningStr };
+          turns.push(turn);
+          finish();
+          drawTurns();
+          // 试运行：统计命中数，帮助用户判断生成方向是否正确
+          post('/api/ai/count', { index, dsl: ev.dsl })
+            .then(r => { turn.hits = r.total; drawTurns(); })
+            .catch(e => {
+              turn.countError = e.message || '试运行失败';
+              drawTurns();
+              // ES 的真实报错（字段不存在、类型不匹配、nested path 写错…）是最准确的自愈素材，
+              // 回喂给模型重生成一次；healed 置位避免与生成阶段的解析自愈叠加成无限重试
+              status.innerHTML = '<span style="color:#d97706">查询执行失败，正在把错误反馈给模型自动重试…</span>';
+              setTimeout(() => generate({
+                prompt,
+                lastError: `生成的 DSL 在 Elasticsearch 上执行失败，错误信息：${turn.countError}。请修正后重新输出，仍须遵守全部规则。`,
+                healed: true
+              }), 300);
+            });
+          return false;
+        } else if (ev.type === 'error') {
+          fail(ev.error || '生成失败');
+          return false;
         }
-      }
-      if (!finished) {
+      });
+      // true = 流自然结束却未收到 done/error，按「流被截断」处理
+      if (settled) {
         if (contentStr.trim()) keepPartial();
         else fail('AI 服务未返回内容，请重试');
       }

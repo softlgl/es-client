@@ -96,7 +96,9 @@ public class QueryBuilder
             case "between":
                 if (string.IsNullOrEmpty(c.Value2))
                     throw new EsException($"字段 {c.Field} 的范围条件需要两个值", 400);
-                return RangeClause(col, "gte", v, c.Value2);
+                // 必须传 "between"：传 "gte" 会命中 RangeClause 的 gte 分支，
+                // 「止」被静默丢弃，区间退化成只有下限 —— 命中数偏多，且用户无从察觉
+                return RangeClause(col, "between", v, c.Value2);
             default:
                 throw new EsException($"不支持的操作符：{c.Op}", 400);
         }
@@ -181,7 +183,7 @@ public class QueryBuilder
             case "lte": range["lte"] = v1; break;
             case "between":
                 range["gte"] = v1;
-                range["lte"] = v2;
+                if (v2 != null) range["lte"] = v2;
                 break;
         }
         // date 字段：用户输入为本地时间，显式指定时区避免被当 UTC

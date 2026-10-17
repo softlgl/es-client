@@ -91,7 +91,7 @@ public class EsHttpClient : IEsClient
 
     // ---------- 底层请求 ----------
 
-    private async Task<JsonNode?> SendAsync(HttpMethod method, string path,
+    private async Task<JsonNode> SendAsync(HttpMethod method, string path,
         string? jsonBody = null, string? contentType = null, CancellationToken ct = default)
     {
         using var req = new HttpRequestMessage(method, path);
@@ -130,7 +130,11 @@ public class EsHttpClient : IEsClient
             throw EsException.FromResponse((int)res.StatusCode, esType, reason, rootType);
         }
 
-        return text.Length == 0 ? null : JsonNode.Parse(text);
+        // 非空返回：空响应体一律视为异常。这样返回类型是非空 JsonNode，
+        // 调用处便不必再用 ! 抑制（原先散落 10 处，可空性一旦被误信就是运行期 NRE）
+        if (text.Length == 0)
+            throw new EsException($"ES 返回空响应（{method} {path}）");
+        return JsonNode.Parse(text) ?? throw new EsException($"ES 返回空响应（{method} {path}）");
     }
 
     private static string Serialize(JsonNode? node) => node?.ToJsonString() ?? "";
@@ -158,23 +162,23 @@ public class EsHttpClient : IEsClient
     }
 
     public Task<JsonNode> GetMappingAsync(string index, CancellationToken ct = default) =>
-        SendAsync(HttpMethod.Get, $"{index}/_mapping", ct: ct)!;
+        SendAsync(HttpMethod.Get, $"{index}/_mapping", ct: ct);
 
     public async Task DeleteIndexAsync(string index, CancellationToken ct = default) =>
         await SendAsync(HttpMethod.Delete, index, ct: ct);
 
     public Task<JsonNode> GetSettingsAsync(string index, CancellationToken ct = default) =>
-        SendAsync(HttpMethod.Get, $"{index}/_settings?flat_settings=true&filter_path=*.settings.index.max_result_window", ct: ct)!;
+        SendAsync(HttpMethod.Get, $"{index}/_settings?flat_settings=true&filter_path=*.settings.index.max_result_window", ct: ct);
 
     public Task<JsonNode> GetStatsAsync(string index, CancellationToken ct = default) =>
-        SendAsync(HttpMethod.Get, $"{index}/_stats/docs", ct: ct)!;
+        SendAsync(HttpMethod.Get, $"{index}/_stats/docs", ct: ct);
 
     public async Task<JsonNode> GetDocumentAsync(string index, string id, CancellationToken ct = default)
     {
         // ES 对不存在的文档返回 404 且无 error 错误体（仅 found: false）
         try
         {
-            return await SendAsync(HttpMethod.Get, $"{index}/_doc/{Uri.EscapeDataString(id)}", ct: ct)!;
+            return await SendAsync(HttpMethod.Get, $"{index}/_doc/{Uri.EscapeDataString(id)}", ct: ct);
         }
         catch (EsException ex) when (ex.StatusCode == 404)
         {
@@ -184,18 +188,18 @@ public class EsHttpClient : IEsClient
 
     public Task<JsonNode> IndexDocAsync(string index, string? id, JsonObject doc, CancellationToken ct = default) =>
         string.IsNullOrEmpty(id)
-            ? SendAsync(HttpMethod.Post, $"{index}/_doc", Serialize(doc), ct: ct)!
-            : SendAsync(HttpMethod.Put, $"{index}/_doc/{Uri.EscapeDataString(id)}", Serialize(doc), ct: ct)!;
+            ? SendAsync(HttpMethod.Post, $"{index}/_doc", Serialize(doc), ct: ct)
+            : SendAsync(HttpMethod.Put, $"{index}/_doc/{Uri.EscapeDataString(id)}", Serialize(doc), ct: ct);
 
     public Task<JsonNode> PutDocAsync(string index, string id, JsonObject doc, CancellationToken ct = default) =>
-        SendAsync(HttpMethod.Put, $"{index}/_doc/{Uri.EscapeDataString(id)}", Serialize(doc), ct: ct)!;
+        SendAsync(HttpMethod.Put, $"{index}/_doc/{Uri.EscapeDataString(id)}", Serialize(doc), ct: ct);
 
     public async Task<JsonNode> DeleteDocAsync(string index, string id, CancellationToken ct = default)
     {
         // ES 对删除不存在的文档返回 404 且无 error 错误体（仅 result: not_found）
         try
         {
-            return await SendAsync(HttpMethod.Delete, $"{index}/_doc/{Uri.EscapeDataString(id)}", ct: ct)!;
+            return await SendAsync(HttpMethod.Delete, $"{index}/_doc/{Uri.EscapeDataString(id)}", ct: ct);
         }
         catch (EsException ex) when (ex.StatusCode == 404)
         {
@@ -207,17 +211,17 @@ public class EsHttpClient : IEsClient
     {
         var body = query != null ? new JsonObject { ["query"] = query.DeepClone() } : null;
         var res = await SendAsync(HttpMethod.Post, $"{index}/_count", Serialize(body), ct: ct);
-        return res?["count"]?.GetValue<long>() ?? 0;
+        return res["count"]?.GetValue<long>() ?? 0;
     }
 
     public Task<JsonNode> SearchAsync(string index, JsonObject body, CancellationToken ct = default) =>
-        SendAsync(HttpMethod.Post, $"{index}/_search", body.ToJsonString(), ct: ct)!;
+        SendAsync(HttpMethod.Post, $"{index}/_search", body.ToJsonString(), ct: ct);
 
     public async Task<(JsonNode Body, string ScrollId)> SearchWithScrollAsync(
         string index, JsonObject body, string keepAlive, CancellationToken ct = default)
     {
         var res = await SendAsync(HttpMethod.Post, $"{index}/_search?scroll={keepAlive}", body.ToJsonString(), ct: ct);
-        return (res!, res?["_scroll_id"]?.GetValue<string>() ?? "");
+        return (res, res["_scroll_id"]?.GetValue<string>() ?? "");
     }
 
     public async Task<(JsonNode Body, string ScrollId)> ScrollNextAsync(
@@ -225,7 +229,7 @@ public class EsHttpClient : IEsClient
     {
         var body = new JsonObject { ["scroll"] = keepAlive, ["scroll_id"] = scrollId };
         var res = await SendAsync(HttpMethod.Post, "_search/scroll", body.ToJsonString(), ct: ct);
-        var newId = res?["_scroll_id"]?.GetValue<string>() ?? scrollId;
+        var newId = res["_scroll_id"]?.GetValue<string>() ?? scrollId;
         return (res!, newId);
     }
 
@@ -238,7 +242,7 @@ public class EsHttpClient : IEsClient
     public Task<JsonNode> BulkAsync(string ndjson, string? index = null, CancellationToken ct = default) =>
         SendAsync(HttpMethod.Post,
             string.IsNullOrEmpty(index) ? "_bulk" : $"{index}/_bulk",
-            ndjson, "application/x-ndjson", ct)!;
+            ndjson, "application/x-ndjson", ct);
 
     public void Dispose() => _http.Dispose();
 }

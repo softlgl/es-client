@@ -23,7 +23,10 @@ public class ConnectionStore
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // 既有 connections.json 用的是小写键（此前由手写匿名对象的属性名决定）。
+        // 换成强类型 DTO 后必须显式声明，否则属性名会变成 PascalCase 导致旧配置读不回来。
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
     private readonly string _filePath;
@@ -166,25 +169,47 @@ public class ConnectionStore
     }
 
     // ---------- 持久化 ----------
+    /// <summary>
+    /// connections.json 的持久化结构。
+    /// 此前「存」用手写匿名对象、「读」用逐字段 JsonNode 取值，加一个字段要改两处，
+    /// 且键名拼错不会编译报错、只会静默丢值。改为强类型后由序列化器保证两侧一致。
+    /// </summary>
+    private sealed class PersistedFile
+    {
+        public List<PersistedConnection> Connections { get; set; } = [];
+    }
+
+    private sealed class PersistedConnection
+    {
+        public string? Name { get; set; }
+        public string? Url { get; set; }
+        public string? Username { get; set; }
+        public string? Password { get; set; }
+        public string? ApiKey { get; set; }
+        public bool Insecure { get; set; }
+        public string? ClusterName { get; set; }
+        public string? Version { get; set; }
+        public int Major { get; set; }
+    }
 
     private void Save()
     {
         try
         {
-            var doc = new
+            var doc = new PersistedFile
             {
-                connections = _map.Values.Select(e => new
+                Connections = _map.Values.Select(e => new PersistedConnection
                 {
-                    name = e.Request.Name,
-                    url = e.Request.Url,
-                    username = e.Request.Username,
-                    password = e.Request.Password,
-                    apiKey = e.Request.ApiKey,
-                    insecure = e.Request.Insecure,
-                    clusterName = e.Info.ClusterName,
-                    version = e.Info.Version,
-                    major = e.Info.Major
-                })
+                    Name = e.Request.Name,
+                    Url = e.Request.Url,
+                    Username = e.Request.Username,
+                    Password = e.Request.Password,
+                    ApiKey = e.Request.ApiKey,
+                    Insecure = e.Request.Insecure,
+                    ClusterName = e.Info.ClusterName,
+                    Version = e.Info.Version,
+                    Major = e.Info.Major
+                }).ToList()
             };
             var tmp = _filePath + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(doc, JsonOpts));
@@ -198,25 +223,24 @@ public class ConnectionStore
         try
         {
             if (!File.Exists(_filePath)) return;
-            var node = JsonNode.Parse(File.ReadAllText(_filePath));
-            if (node?["connections"] is not JsonArray arr) return;
-            foreach (var n in arr.OfType<JsonObject>())
+            var file = JsonSerializer.Deserialize<PersistedFile>(File.ReadAllText(_filePath), JsonOpts);
+            if (file?.Connections == null) return;
+            foreach (var c in file.Connections)
             {
-                var url = n["url"]?.GetValue<string>();
-                if (string.IsNullOrEmpty(url)) continue;
+                if (string.IsNullOrEmpty(c.Url)) continue;
                 var request = new ConnectRequest(
-                    url,
-                    n["username"]?.GetValue<string>(),
-                    n["password"]?.GetValue<string>(),
-                    n["apiKey"]?.GetValue<string>(),
-                    n["insecure"]?.GetValue<bool>() ?? false,
-                    n["name"]?.GetValue<string>());
+                    c.Url,
+                    c.Username,
+                    c.Password,
+                    c.ApiKey,
+                    c.Insecure,
+                    c.Name);
                 var info = new Es.ConnectionInfo(
-                    url,
-                    n["clusterName"]?.GetValue<string>() ?? "unknown",
-                    n["version"]?.GetValue<string>() ?? "unknown",
-                    n["major"]?.GetValue<int>() ?? 0);
-                _map[url] = new ConnectionEntry { Request = request, Info = info, Client = null };
+                    c.Url,
+                    c.ClusterName ?? "unknown",
+                    c.Version ?? "unknown",
+                    c.Major);
+                _map[c.Url] = new ConnectionEntry { Request = request, Info = info, Client = null };
             }
         }
         catch { /* 文件损坏则忽略，当作无保存 */ }

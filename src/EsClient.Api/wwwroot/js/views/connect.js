@@ -1,5 +1,5 @@
 import { post, toast } from '../api.js?v=14';
-import { showModal, closeAllModals, modalRoot } from './browse.js?v=14';
+import { showModal, closeAllModals, modalRoot } from '../ui.js?v=14';
 
 // 连接表单（连接页与弹窗共用）；existing 传入时为编辑模式
 const FORM_HTML = `

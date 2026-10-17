@@ -1,4 +1,3 @@
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using EsClient.Api.Es;
 using EsClient.Api.Services;
@@ -91,9 +90,7 @@ public class AiChatController : ControllerBase
             return;
         }
 
-        Response.StatusCode = 200;
-        Response.ContentType = "text/event-stream";
-        Response.Headers.CacheControl = "no-cache";
+        SseStream.Begin(Response);
 
         var question = req.Question.Trim();
         var sessionId = string.IsNullOrWhiteSpace(req.SessionId)
@@ -117,15 +114,15 @@ public class AiChatController : ControllerBase
             var start = Math.Max(0, end - 10);
             var historyTurns = allTurns.Skip(start).Take(end - start).ToList();
 
-            var messages = new List<object> { new { role = "system", content = BuildGenSystemPrompt() } };
+            var messages = new List<object> { new { role = "system", content = AiPrompts.ChatGenerateSystem() } };
             foreach (var t in historyTurns)
                 messages.Add(new { role = t.Role, content = t.Text });
-            messages.Add(new { role = "user", content = BuildGenUserPrompt(index, meta, samples, question, req.TimeZone, req.CurrentQuery) });
+            messages.Add(new { role = "user", content = AiPrompts.ChatGenerateUser(index, meta, samples, question, req.TimeZone, req.CurrentQuery) });
 
             // 第一次生成 DSL
             var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
                 (type, text) => WriteSseAsync(type, new { text }, ct), ct);
-            var (body, parseError) = ExtractSearchBody(content);
+            var (body, parseError) = AiDslGuard.ExtractSearchBody(content);
 
             // 执行；失败把 ES 报错喂回去重新生成一次
             JsonNode? result = null;
@@ -138,7 +135,7 @@ public class AiChatController : ControllerBase
                     messages.Add(new { role = "user", content = $"上一次生成的 DSL 执行失败，错误信息：{execError}。请修正后重新输出，仍只输出一个 JSON 对象。" });
                     content = await _aiClient.StreamAsync(messages, req.Thinking == true,
                         (type, text) => WriteSseAsync(type, new { text }, ct), ct);
-                    (body, parseError) = ExtractSearchBody(content);
+                    (body, parseError) = AiDslGuard.ExtractSearchBody(content);
                 }
 
                 await WriteSseAsync("dsl", new { dsl = body!.DeepClone() }, ct);
@@ -175,8 +172,8 @@ public class AiChatController : ControllerBase
             var resultJson = TrimResult(result!);
             var sumMessages = new List<object>
             {
-                new { role = "system", content = BuildSumSystemPrompt() },
-                new { role = "user", content = BuildSumUserPrompt(question, resultJson, historyTurns) }
+                new { role = "system", content = AiPrompts.ChatSummarizeSystem() },
+                new { role = "user", content = AiPrompts.ChatSummarizeUser(question, resultJson, historyTurns) }
             };
             var answer = await _aiClient.StreamAsync(sumMessages, false,
                 (type, text) => type == "content" ? WriteSseAsync("content", new { text }, ct) : Task.CompletedTask, ct);
@@ -198,126 +195,13 @@ public class AiChatController : ControllerBase
                 turn = new { role = "assistant", text = answer, dsl = body.ToJsonString(), data = tableData, time = now }
             }, ct);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            return; // 客户端已中断，静默结束
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            await WriteSseAsync("error", new { error = "AI 服务响应超时，请检查接口地址或稍后重试" }, CancellationToken.None);
-        }
-        catch (EsException ex)
-        {
-            await WriteSseAsync("error", new { error = ex.Message }, ct);
-        }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "AI 问答失败：{Index}", index);
-            await WriteSseAsync("error", new { error = $"AI 服务调用失败：{ex.Message}" }, ct);
+            await SseStream.HandleErrorAsync(Response, ex, _logger, $"AI 问答失败：{index}", ct);
         }
     }
 
-    // ---------- 请求体解析与安全约束 ----------
-
-    private static readonly string[] AllowedRootKeys = ["query", "aggs", "aggregations", "size", "sort", "_source", "track_total_hits"];
-
-    /// <summary>从模型输出提取 search 请求体：剥围栏 → 截 JSON → 白名单键 + 禁 script + 限 size。</summary>
-    private static (JsonObject? Body, string? Error) ExtractSearchBody(string content)
-    {
-        var text = StripFences(content.Trim());
-        var start = text.IndexOf('{');
-        var end = text.LastIndexOf('}');
-        if (start < 0 || end <= start) return (null, "AI 返回的内容不是有效 JSON");
-        JsonNode? node;
-        try { node = JsonNode.Parse(text[start..(end + 1)]); }
-        catch { return (null, "AI 返回的内容不是有效 JSON"); }
-        if (node is not JsonObject obj) return (null, "AI 返回的内容不是 JSON 对象");
-
-        foreach (var key in obj.Select(kvp => kvp.Key).ToList())
-            if (!AllowedRootKeys.Contains(key))
-            {
-                _ = obj.Remove(key); // 静默丢弃无关顶层键，而非整体拒绝
-            }
-        if (obj["aggregations"] != null && obj["aggs"] == null)
-            obj["aggs"] = obj["aggregations"]!.DeepClone();
-        obj.Remove("aggregations");
-
-        if (obj["query"] == null && obj["aggs"] == null)
-            return (null, "生成的 DSL 缺少 query 或 aggs 子句");
-        if (HasScriptKey(obj))
-            return (null, "为安全起见问答不支持 script，请改用普通聚合/查询");
-
-        // size 约束：缺省 0（聚合优先），上限 10（明细展示用）
-        int size = 0;
-        try { size = obj["size"]?.GetValue<int>() ?? 0; } catch { /* 非数值按 0 处理 */ }
-        if (size is < 0 or > 10) size = Math.Clamp(size, 0, 10);
-        obj["size"] = size;
-        obj["track_total_hits"] = true;
-
-        ClampTermsSize(obj);
-
-        return (obj, null);
-    }
-
-    /// <summary>
-    /// 递归钳制 terms 聚合的 size（上限 <paramref name="max"/>，下限 1）。
-    /// query 的 size 有硬上限，聚合侧此前完全依赖提示词自律；模型在高基数字段上
-    /// 给出大 size 的 terms 会让 ES 长时间占用分片缓存，与 size 约束形成不对称保护。
-    /// 只改显式写了非法值的节点，不给缺省的 size 赋值，避免无谓地改写模型输出。
-    /// </summary>
-    private static void ClampTermsSize(JsonNode node, int max = 50)
-    {
-        switch (node)
-        {
-            case JsonObject obj:
-                if (obj["terms"] is JsonObject terms && terms["field"] != null)
-                    ClampOne(terms);
-                // 多字段 terms：{"terms":[{"field":"a"},{"field":"b"}]}
-                if (obj["terms"] is JsonArray termsArr)
-                    foreach (var t in termsArr.OfType<JsonObject>())
-                        ClampOne(t);
-                foreach (var (_, v) in obj) if (v != null) ClampTermsSize(v, max);
-                break;
-            case JsonArray arr:
-                foreach (var v in arr) if (v != null) ClampTermsSize(v, max);
-                break;
-        }
-
-        return;
-
-        void ClampOne(JsonObject terms)
-        {
-            if (terms["size"] is JsonValue v && v.TryGetValue<int>(out var raw) && (raw < 1 || raw > max))
-                terms["size"] = Math.Clamp(raw, 1, max);
-        }
-    }
-
-    private static string StripFences(string text)
-    {
-        var fenceStart = text.IndexOf("```", StringComparison.Ordinal);
-        while (fenceStart >= 0)
-        {
-            var lineEnd = text.IndexOf('\n', fenceStart);
-            if (lineEnd < 0) break;
-            var fenceEnd = text.IndexOf("```", lineEnd, StringComparison.Ordinal);
-            if (fenceEnd < 0) break;
-            var inner = text[(lineEnd + 1)..fenceEnd].Trim();
-            if (inner.StartsWith('{')) return inner;
-            fenceStart = text.IndexOf("```", fenceEnd + 3, StringComparison.Ordinal);
-        }
-        return text;
-    }
-
-    /// <summary>递归检查是否含 script（含 script_score / script_fields 等一切脚本注入点）。</summary>
-    private static bool HasScriptKey(JsonNode node)
-    {
-        if (node is JsonObject obj)
-            return obj.Any(kvp => kvp.Key.EqualsIgnoreCase("script") || kvp.Key.EqualsIgnoreCase("runtime_mappings") || kvp.Key.EqualsIgnoreCase("runtime_fields"))
-                || obj.Any(kvp => kvp.Value != null && HasScriptKey(kvp.Value));
-        if (node is JsonArray arr)
-            return arr.Any(n => n != null && HasScriptKey(n));
-        return false;
-    }
+    
 
     // ---------- 结果裁剪与表格数据 ----------
 
@@ -424,10 +308,7 @@ public class AiChatController : ControllerBase
                 {
                     table["aggField"] = aggField;
                     // nested 路径下的字段必须用 nested 查询包裹，否则 term 匹配不到嵌套文档
-                    var nested = meta.NestedPaths
-                        .Where(p => aggField == p || aggField.StartsWith(p + "."))
-                        .OrderByDescending(p => p.Length)
-                        .FirstOrDefault();
+                    var nested = meta.ResolveNestedPath(aggField);
                     if (nested != null) table["aggNested"] = nested;
                 }
                 return table;
@@ -493,124 +374,10 @@ public class AiChatController : ControllerBase
         turns = s.Turns.Select(t => new { role = t.Role, text = t.Text, dsl = t.Dsl, data = t.Data, time = t.Time })
     };
 
-    // ---------- Prompt ----------
+    
 
-    private static string BuildGenSystemPrompt() => """
-        你是 Elasticsearch 数据分析助手。根据用户问题，生成对目标索引执行 search 的请求体 JSON，用于聚合统计或查询明细。
-        规则：
-        1. 只输出一个 JSON 对象，禁止任何解释文字、markdown 围栏或注释。
-        2. 顶层只能包含：query、aggs、size、sort、_source。禁止 script、suggest、knn、runtime_mappings。
-        3. 统计类问题（多少、平均、总和、分布、占比、Top N）：size 设为 0，用 aggs 表达；terms 聚合默认 size 20，最大不超过 50。
-        4. 明细类问题（列出、查看、举例）：size 设 1~10，必要时加 sort（如 {"createTime":{"order":"desc"}}），_source 只保留问题相关字段。
-        5. 只能使用「字段列表」中给出的字段名（完整路径），禁止编造字段。
-        6. 类型选型：keyword/ip/version 用 term（多值用 terms）；text 用 match / match_phrase，需精确匹配时若标注了 keyword 子字段则改用之；数值与日期范围用 range；判断存在用 exists。
-        7. 中文时间词转 ES now 表达式（由 ES 执行时计算，禁止换算为绝对日期）：
-        """ + AiPrompts.TimeMapping + """
-           绝对日期用标准 ISO 格式。
-        8. 多条件组合用 bool：且→must，或→should 并加 minimum_should_match:1，非→must_not。
-        9. 标注「nested路径」的字段必须用 nested 查询/聚合包裹并指定 path。
-        10. 结合上一轮问答历史理解指代（如「再细一点」「换成上个月」）。
-        11. 用户消息中若带有「用户当前正在数据浏览中查看的筛选条件」，那是他此刻关注的范围与口径：
-            问题未指明范围时沿用它，问题明确指向别的范围时以问题为准，不要被它绑住。
-        示例：
-        问题：各状态的订单数是多少
-        输出：{"query":{"match_all":{}},"size":0,"aggs":{"status_count":{"terms":{"field":"status","size":20}}}}
-        问题：上个月订单的平均金额
-        输出：{"query":{"range":{"createdAt":{"gte":"now-1M/M","lte":"now/M","time_zone":"+08:00"}}},"size":0,"aggs":{"avg_amount":{"avg":{"field":"amount"}}}}
-        问题：金额最高的 5 笔订单，列出状态和金额
-        输出：{"query":{"match_all":{}},"size":5,"sort":[{"amount":{"order":"desc"}}],"_source":["status","amount"]}
-        """;
-
-    private static string BuildSumSystemPrompt() => """
-        你是数据分析师。根据 Elasticsearch 查询结果 JSON，用中文简洁回答用户问题。
-        规则：
-        1. 所有数字必须来自结果 JSON，禁止编造或自行推算结果中不存在的数据。
-        2. 结果为空（total 为 0 或无 buckets/rows）时如实说明。
-        3. 先给结论，再给关键数字；控制在 150 字以内。
-        4. doc_count 是文档数；percentiles / stats 等指标值原样引用，保留其原有精度，不要自行取整或换算单位。
-        5. 用户消息中的「此前用户已提问」仅用于理解本轮问题的指代（如「再细一点」「换成上个月」），只回答本轮问题，不要重复回答历史问题。
-        6. buckets 内出现 _note 说明 terms 分桶被 size 截断、数据不完整，此时禁止用已列分桶除以 total 得出占比；被问到占比时如实说明分桶不完整。
-        """;
-
-    /// <summary>
-    /// 总结阶段的用户消息，附上本轮之前若干条提问作为指代锚点。
-    /// 总结阶段不像生成阶段那样能读到完整历史，若只发本轮问句，模型无从解析
-    /// 「再细一点」「换成上个月」这类追问，回答会与生成阶段的查询口径脱节。
-    /// </summary>
-    private static string BuildSumUserPrompt(string question, JsonNode result,
-        List<ChatStore.ChatTurn> historyTurns)
-    {
-        var sb = new System.Text.StringBuilder();
-        var prior = historyTurns
-            .Where(t => t.Role == "user" && !string.IsNullOrWhiteSpace(t.Text))
-            .Select(t => t.Text)
-            .TakeLast(4)
-            .ToList();
-        if (prior.Count > 0)
-        {
-            sb.AppendLine("此前用户已按顺序提问（仅用于理解本轮问题的指代，不要重复作答）：");
-            for (var i = 0; i < prior.Count; i++)
-                sb.AppendLine($"{i + 1}. {prior[i]}");
-            sb.AppendLine();
-        }
-        sb.Append($"本轮问题：{question}\n\nES 查询结果 JSON：\n{result.ToJsonString()}");
-        return sb.ToString();
-    }
-
-    private static string BuildGenUserPrompt(string index, IndexMeta meta,
-        Dictionary<string, string[]> samples, string question, string? timeZone, string? currentQuery)
-    {
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"目标索引：{index}（文档数 {meta.DocsCount.ToString("N0")}）");
-        if (!string.IsNullOrWhiteSpace(timeZone))
-        {
-            var localNow = DateTimeOffset.UtcNow;
-            try
-            {
-                var tzi = TimeZoneInfo.FindSystemTimeZoneById(timeZone);
-                localNow = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, tzi);
-            }
-            catch { /* 未知时区标识则退回 UTC 时间 */ }
-            sb.AppendLine($"当前时间：{localNow:yyyy-MM-dd HH:mm}（时区 {timeZone}）。date 字段的 range 查询请添加 \"time_zone\":\"{timeZone}\"。");
-        }
-        sb.AppendLine("字段列表（字段名 | 类型[| keyword子字段][| 示例值]）：");
-        foreach (var c in meta.Columns)
-        {
-            var field = c.KeywordPath ?? c.Path;
-            var line = $"- {c.Path} | {c.Type}";
-            if (c.Type == "text" && c.KeywordPath != null) line += $" | keyword子字段: {c.KeywordPath}";
-            var nestedPath = meta.NestedPaths
-                .Where(p => c.Path == p || c.Path.StartsWith(p + "."))
-                .OrderByDescending(p => p.Length)
-                .FirstOrDefault();
-            if (nestedPath != null) line += $" | nested路径: {nestedPath}";
-            if (samples.TryGetValue(field, out var vals))
-                line += $" | 示例值: {string.Join(", ", vals)}";
-            sb.AppendLine(line);
-        }
-        if (!string.IsNullOrWhiteSpace(currentQuery))
-        {
-            // 浏览上下文：说明它是「参考」而非「要复现的目标」，否则模型容易直接照抄这份筛选条件，
-            // 导致用户问别的口径时仍被历史条件绑住
-            sb.AppendLine($"用户当前正在「数据浏览」中查看以下筛选条件（仅供理解他关注的范围与口径，不要机械照搬；本轮问题优先）：");
-            sb.AppendLine(currentQuery);
-        }
-        sb.AppendLine();
-        sb.Append($"用户问题：{question}");
-        return sb.ToString();
-    }
-
-    private async Task WriteSseAsync(string type, object payload, CancellationToken ct)
-    {
-        var node = JsonSerializer.SerializeToNode(payload) as JsonObject ?? new JsonObject();
-        node["type"] = type;
-        await Response.WriteAsync($"data: {node.ToJsonString()}\n\n", ct);
-        await Response.Body.FlushAsync(ct);
-    }
+    private Task WriteSseAsync(string type, object payload, CancellationToken ct) =>
+        SseStream.WriteAsync(Response, type, payload, ct);
 }
 
-file static class JsonNodeKeyExtensions
-{
-    public static bool EqualsIgnoreCase(this string key, string other) =>
-        string.Equals(key, other, StringComparison.OrdinalIgnoreCase);
-}
+

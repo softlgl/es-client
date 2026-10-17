@@ -70,10 +70,12 @@ public class ConnectController : ControllerBase
 
         if (!string.Equals(req.Url, req.Id, StringComparison.OrdinalIgnoreCase))
         {
-            // 地址变更：删除旧条目按新地址重建；原为活动连接则新连接接管，否则保持断开态
+            // 地址变更：先建连验证，成功后再删旧条目按新地址重建。顺序不能反 ——
+            // 新地址填错时 CreateAsync 会抛异常，而 Remove 已把旧条目连同凭据落盘删除，
+            // 用户仅是改个地址打错一个字就会丢掉整个连接，且无从恢复。
             var wasActive = _store.Active != null && string.Equals(_store.Active.Info.Url, req.Id, StringComparison.OrdinalIgnoreCase);
-            _store.Remove(req.Id);
             var client = await EsHttpClient.CreateAsync(newReq, ct);
+            _store.Remove(req.Id);
             if (wasActive) _store.Set(client, newReq);
             else
             {

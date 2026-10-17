@@ -1,7 +1,8 @@
-import { get, post, put, del, toast, fmtNum } from '../api.js?v=14';
-import { escapeHtml } from './indices.js?v=14';
+import { get, post, toast, fmtNum } from '../api.js?v=14';
+import { escapeHtml, showModal, closeAllModals, modalRoot } from '../ui.js?v=14';
 import { openExportDialog } from './export-dialog.js?v=14';
 import { openAiDialog } from './ai-dialog.js?v=14';
+import { openDocDetail, openNewDocDialog } from './doc-dialog.js?v=14';
 
 const OPS = [
   { v: 'eq', label: '等于' }, { v: 'ne', label: '不等于' },
@@ -326,7 +327,7 @@ export async function renderBrowse(view, index) {
     getQuery: buildQuery
   }));
   $('#btn-cols').addEventListener('click', () => openColumnSelector(''));
-  $('#btn-newdoc').addEventListener('click', () => openNewDocDialog());
+  $('#btn-newdoc').addEventListener('click', () => openNewDocDialog(index, refreshAfterWrite));
   $('#vs-ai').addEventListener('click', () => {
     location.hash = `#/ai/${encodeURIComponent(index)}`;
   });
@@ -511,7 +512,7 @@ export async function renderBrowse(view, index) {
               <td class="_id-cell" title="${escapeHtml(r.id)}">${escapeHtml(r.id)}</td>
               ${visibleCols.map((c, i) => {
                 const cell = r.cells[meta.columns.indexOf(c)];
-                return `<td>${renderCell(cell, r.id)}</td>`;
+                return `<td>${renderCell(cell, r.id, c.path)}</td>`;
               }).join('')}
             </tr>`).join('')}
         </tbody>
@@ -528,137 +529,61 @@ export async function renderBrowse(view, index) {
       load();
     }));
     wrap.querySelectorAll('tbody tr').forEach(tr =>
-      tr.addEventListener('click', () => openDocDetail(tr.dataset.id)));
+      tr.addEventListener('click', () => openDocDetail(index, tr.dataset.id, refreshAfterWrite)));
+    // 长值/JSON 单元格点开看完整值。必须 stopPropagation，否则会连带触发上面的
+    // 整行点击、把文档详情弹窗顶掉
+    wrap.querySelectorAll('td .cell-json, td .cell-long').forEach(el =>
+      el.addEventListener('click', e => {
+        e.stopPropagation();
+        showFullCell(el.dataset.id, el.dataset.col);
+      }));
   }
 
-  function renderCell(cell, rowId) {
+  function renderCell(cell, rowId, path) {
     if (cell == null || cell.v === null || cell.v === undefined) return '';
-    if (cell.kind === 'json') return `<span class="cell-json" data-id="${escapeHtml(rowId)}" title="${escapeHtml(cell.v)}">${escapeHtml(cell.v)}</span>`;
-    if (cell.kind === 'longjson') return `<span class="cell-json cell-long" data-id="${escapeHtml(rowId)}" title="点击查看完整值">{…}</span>`;
-    if (cell.kind === 'long') return `<span class="cell-long" data-id="${escapeHtml(rowId)}" title="点击查看完整值">${escapeHtml(cell.v)}…</span>`;
+    const attrs = `data-id="${escapeHtml(rowId)}" data-col="${escapeHtml(path)}"`;
+    if (cell.kind === 'json') return `<span class="cell-json" ${attrs} title="${escapeHtml(cell.v)}">${escapeHtml(cell.v)}</span>`;
+    if (cell.kind === 'longjson') return `<span class="cell-json cell-long" ${attrs} title="点击查看完整值">{…}</span>`;
+    if (cell.kind === 'long') return `<span class="cell-long" ${attrs} title="点击查看完整值">${escapeHtml(cell.v)}…</span>`;
     return escapeHtml(cell.v);
   }
 
-  async function openDocDetail(id) {
-    let json;
+  // 列表接口对超长值只下发截断内容（后端 BrowseTruncateLength），完整值并不在响应里，
+  // 只能按 _id 回查单文档再取值 —— 这也是 cell 上带 data-id 的原意。
+  async function showFullCell(rowId, path) {
+    if (!rowId || !path) return;
+    let src;
     try {
-      json = await get(`/api/indices/${encodeURIComponent(index)}/documents/${encodeURIComponent(id)}`);
+      const doc = await get(`/api/indices/${encodeURIComponent(index)}/documents/${encodeURIComponent(rowId)}`);
+      src = doc._source ?? doc;
     } catch (e) {
       toast(e.message, true);
       return;
     }
-    const orig = JSON.stringify(json._source ?? json, null, 2);
-    const full = JSON.stringify(json, null, 2);
-    showModal(`文档 ${id}`, `
-      <pre id="doc-view">${escapeHtml(full)}</pre>
-      <textarea class="doc-editor hidden" id="doc-editor" spellcheck="false"></textarea>
-      <div class="doc-actions">
-        <button class="btn btn-danger" id="doc-del">删除</button>
-        <span style="flex:1"></span>
-        <button class="btn hidden" id="doc-cancel">取消</button>
-        <button class="btn btn-primary hidden" id="doc-save">保存</button>
-        <button class="btn" id="doc-copy">复制</button>
-        <button class="btn" id="doc-edit">编辑</button>
-      </div>`);
-    modalRoot.querySelector('#doc-copy').addEventListener('click', async () => {
-      await navigator.clipboard.writeText(full).catch(() => {});
-      toast('已复制到剪贴板');
-    });
-    const view = modalRoot.querySelector('#doc-view');
-    const editor = modalRoot.querySelector('#doc-editor');
-    const btnEdit = modalRoot.querySelector('#doc-edit');
-    const btnSave = modalRoot.querySelector('#doc-save');
-    const btnCancel = modalRoot.querySelector('#doc-cancel');
-    const setMode = editing => {
-      view.classList.toggle('hidden', editing);
-      editor.classList.toggle('hidden', !editing);
-      btnEdit.classList.toggle('hidden', editing);
-      btnSave.classList.toggle('hidden', !editing);
-      btnCancel.classList.toggle('hidden', !editing);
-      if (editing) { editor.value = orig; editor.focus(); }
-    };
-    btnEdit.addEventListener('click', () => setMode(true));
-    btnCancel.addEventListener('click', () => setMode(false));
-    btnSave.addEventListener('click', async () => {
-      let doc;
-      try { doc = JSON.parse(editor.value); }
-      catch { toast('JSON 格式错误，请检查', true); return; }
-      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
-        toast('请输入 JSON 对象', true);
-        return;
-      }
-      btnSave.disabled = true;
-      try {
-        await put(`/api/indices/${encodeURIComponent(index)}/documents/${encodeURIComponent(id)}`, doc);
-        closeAllModals();
-        toast('文档已保存');
-        window.dispatchEvent(new Event('indices-changed'));
-        load();
-      } catch (e) {
-        toast(e.message, true);
-        btnSave.disabled = false;
-      }
-    });
-    modalRoot.querySelector('#doc-del').addEventListener('click', () => {
-      showModal('删除文档', `
-        <div class="del-confirm">
-          <p class="del-warn">将删除文档 <code>${escapeHtml(id)}</code>，该操作不可恢复。</p>
-          <div class="del-actions">
-            <button class="btn" id="deldoc-cancel">取消</button>
-            <button class="btn btn-danger" id="deldoc-ok">确认删除</button>
-          </div>
-        </div>`);
-      modalRoot.querySelector('#deldoc-cancel').addEventListener('click', closeAllModals);
-      modalRoot.querySelector('#deldoc-ok').addEventListener('click', async () => {
-        try {
-          await del(`/api/indices/${encodeURIComponent(index)}/documents/${encodeURIComponent(id)}`);
-          closeAllModals();
-          toast(`文档 ${id} 已删除`);
-          window.dispatchEvent(new Event('indices-changed'));
-          load();
-        } catch (e) {
-          toast(e.message, true);
-        }
-      });
-    });
+    const v = readPath(src, path);
+    const text = v == null ? '（该文档中此字段无值）'
+      : typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v);
+    showModal(`字段完整值 — ${path}`, `<pre>${escapeHtml(text)}</pre>`);
   }
 
-  function openNewDocDialog() {
-    showModal('新增文档', `
-      <div class="doc-form">
-        <input type="text" class="doc-id-input" id="newdoc-id" placeholder="_id（留空自动生成）" autocomplete="off">
-        <textarea class="doc-editor" id="newdoc-json" spellcheck="false"
-                  placeholder='{ "field": "value" }' style="min-height:200px"></textarea>
-        <div class="del-actions">
-          <button class="btn" id="newdoc-cancel">取消</button>
-          <button class="btn btn-primary" id="newdoc-ok">保存</button>
-        </div>
-      </div>`);
-    modalRoot.querySelector('#newdoc-cancel').addEventListener('click', closeAllModals);
-    modalRoot.querySelector('#newdoc-ok').addEventListener('click', async () => {
-      const ok = modalRoot.querySelector('#newdoc-ok');
-      let doc;
-      try { doc = JSON.parse(modalRoot.querySelector('#newdoc-json').value); }
-      catch { toast('JSON 格式错误，请检查', true); return; }
-      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
-        toast('请输入 JSON 对象', true);
-        return;
-      }
-      ok.disabled = true;
-      try {
-        const res = await post(`/api/indices/${encodeURIComponent(index)}/docs`,
-          { id: modalRoot.querySelector('#newdoc-id').value.trim() || null, doc });
-        closeAllModals();
-        toast(`文档已新增：${res.id}`);
-        window.dispatchEvent(new Event('indices-changed'));
-        load();
-      } catch (e) {
-        toast(e.message, true);
-        ok.disabled = false;
-      }
-    });
-    modalRoot.querySelector('#newdoc-json').focus();
+  // 列路径取值，语义与后端 PagerService.ExtractCell 对齐：逐级下钻，
+  // 中途遇到数组即整体取值（对应后端 break 出循环后序列化整个数组）
+  function readPath(obj, path) {
+    let cur = obj;
+    for (const seg of path.split('.')) {
+      if (Array.isArray(cur)) return cur;
+      if (cur == null || typeof cur !== 'object') return null;
+      cur = cur[seg];
+    }
+    return cur ?? null;
   }
+
+  // 文档增删改成功后：通知侧栏刷新计数，并重载当前页表格
+  // （doc-dialog.js 的保存/删除回调，原先靠闭包捕获 load() 实现）
+  const refreshAfterWrite = () => {
+    window.dispatchEvent(new Event('indices-changed'));
+    load();
+  };
 
   // ---------- 分页条 ----------
   function drawPager() {
@@ -714,42 +639,4 @@ export async function renderBrowse(view, index) {
   drawConditions();
   updateHint();
   load();
-}
-
-// ---------- 弹窗工具 ----------
-export const modalRoot = document.getElementById('modal-root');
-
-let modalCloseHook = null;   // 当前弹窗被任意方式关闭时触发的回调
-
-export function showModal(title, bodyHtml, onMount, onClose) {
-  closeAllModals();
-  modalRoot.innerHTML = `
-    <div class="modal-mask">
-      <div class="modal">
-        <div class="modal-head"><h3>${escapeHtml(title)}</h3>
-          <button class="modal-close">×</button></div>
-        <div class="modal-body">${bodyHtml}</div>
-      </div>
-    </div>`;
-  modalCloseHook = typeof onClose === 'function' ? onClose : null;
-  modalRoot.querySelector('.modal-close').addEventListener('click', closeAllModals);
-  // 仅当按下与松开都在遮罩上（纯点击遮罩）才关闭，避免弹窗内拖拽选择文本时误关
-  const mask = modalRoot.querySelector('.modal-mask');
-  let maskDown = false;
-  mask.addEventListener('mousedown', e => { maskDown = e.target === mask; });
-  mask.addEventListener('click', e => {
-    const pureClick = e.target === mask && maskDown;
-    maskDown = false;
-    if (pureClick) closeAllModals();
-  });
-  if (onMount) onMount();
-}
-
-export function closeAllModals() {
-  const hook = modalCloseHook;
-  modalCloseHook = null;
-  modalRoot.innerHTML = '';
-  if (hook) {
-    try { hook(); } catch { /* 关闭回调异常不阻塞关闭 */ }
-  }
 }
