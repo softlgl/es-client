@@ -1,7 +1,7 @@
-import { get, post, put, del, toast, fmtNum } from '../api.js?v=13';
-import { escapeHtml } from './indices.js?v=13';
-import { openExportDialog } from './export-dialog.js?v=13';
-import { openAiDialog } from './ai-dialog.js?v=13';
+import { get, post, put, del, toast, fmtNum } from '../api.js?v=14';
+import { escapeHtml } from './indices.js?v=14';
+import { openExportDialog } from './export-dialog.js?v=14';
+import { openAiDialog } from './ai-dialog.js?v=14';
 
 const OPS = [
   { v: 'eq', label: '等于' }, { v: 'ne', label: '不等于' },
@@ -15,9 +15,31 @@ const NO_VALUE_OPS = new Set(['exists', 'missing']);
 
 // 每个索引的浏览状态（条件/翻页/列选择/排序），切换索引后切回可恢复
 const stateCache = new Map();
+// 每个索引最近一次实际执行的查询（buildQuery 的结果），供 AI 问答读取浏览上下文
+const lastQueries = new Map();
 
 // 断开/切换连接时调用：不同集群同名索引结构可能不同
-export function clearBrowseCache() { stateCache.clear(); }
+export function clearBrowseCache() { stateCache.clear(); lastQueries.clear(); }
+
+const OP_LABELS = Object.fromEntries(OPS.map(o => [o.v, o.label]));
+
+// 把最近一次执行的查询转成一行可读描述，供 AI 问答作为上下文。
+// 用可读文本而非项目内部结构，避免让模型额外理解 {conditions, queryString, dsl} 这套私有格式。
+export function getBrowseQueryContext(index) {
+  const q = lastQueries.get(index);
+  if (!q) return null;              // 未查询过 / 无任何条件：等同于 match_all，无需作为上下文
+  if (q.conditions?.length) {
+    const parts = q.conditions.map(c => {
+      const op = OP_LABELS[c.op] || c.op;
+      if (NO_VALUE_OPS.has(c.op)) return `${c.field} ${op}`;
+      return c.op === 'between' ? `${c.field} ${op} ${c.value} ~ ${c.value2}` : `${c.field} ${op} ${c.value}`;
+    });
+    return `简单查询：条件全部为「且」关系 —— ${parts.join(' 且 ')}`;
+  }
+  if (q.queryString) return `query_string 查询表达式：${q.queryString}`;
+  if (q.dsl) return `DSL 查询请求体：${JSON.stringify(q.dsl)}`;
+  return null;
+}
 
 export async function renderBrowse(view, index) {
   view.innerHTML = '<div class="panel browse-toolbar">加载中…</div>';
@@ -53,16 +75,22 @@ export async function renderBrowse(view, index) {
   state.meta = meta; // meta 每次重新拉取（服务端有缓存）
   if (isNew) stateCache.set(index, state);
 
-  // AI 问答「填入查询面板」：接管本次渲染，切到 DSL 模式并填入查询体。
-  // 填入后不自动执行，跳过渲染末尾的初始 load()，由用户确认后手动点「查询」
-  let skipAutoLoad = false;
-  const applyDsl = sessionStorage.getItem('ai-apply-dsl');
-  if (applyDsl) {
-    sessionStorage.removeItem('ai-apply-dsl');
+  // AI 问答「在数据浏览中打开」：接管本次渲染，切到 DSL 模式、填入查询体并直接执行。
+  // 本文件是唯一使用该 sessionStorage 的入口（AI 生成查询弹窗走闭包回调直接改 DOM，不经此处），
+  // 所以读取即消费，无需再区分「只填入 / 填入并执行」两种模式。
+  const openDsl = sessionStorage.getItem('ai-open-in-browse');
+  if (openDsl) {
+    sessionStorage.removeItem('ai-open-in-browse');
     state.tab = 'query';
     state.qsMode = 'dsl';
-    state.dslText = applyDsl;
-    skipAutoLoad = true;
+    // 换查询了就得从头看起，否则 load() 会拿 state.history 栈顶当起点（旧偏移），
+    // 在新筛选条件下列表可能整页为空，表现为「打开没反应」
+    resetPages();
+    // 后端仅在 req.Sort 为空时才采用 DSL 内的 sort，残留的表头排序会盖掉 DSL 的排序
+    state.sort = null;
+    // 原样保留 DSL 的 size：浏览页要复现问答那一次查询，改写会让行数与问答页对不上。
+    // 想看更多就在工具条改每页条数，load() 会把该值同步回下拉框与 DSL 的 size。
+    state.dslText = openDsl;
   }
 
   // 无 mapping 时用首页文档采样兜底
@@ -101,6 +129,10 @@ export async function renderBrowse(view, index) {
       <div class="browse-main">
         <div class="panel">
           <div class="browse-toolbar">
+            <div class="view-switch">
+              <button class="active">数据浏览</button>
+              <button id="vs-ai" title="针对当前索引向 AI 提问">✨ AI 问答</button>
+            </div>
             <span class="idx-name">${escapeHtml(index)}</span>
             <span class="docs" id="docs-info"></span>
             <span class="spacer"></span>
@@ -171,6 +203,7 @@ export async function renderBrowse(view, index) {
     view.querySelectorAll('.query-tab').forEach(x => x.classList.toggle('active', x === t));
     $('#cond-area').classList.toggle('hidden', state.tab !== 'simple');
     $('#qs-area').classList.toggle('hidden', state.tab !== 'query');
+    updateHint(); // 切离 DSL 模式后移除「每页条数由 DSL 决定」的提示
   }));
 
   // query_string / DSL 模式切换
@@ -179,6 +212,7 @@ export async function renderBrowse(view, index) {
     $('#qs-qs-wrap').hidden = mode === 'dsl';
     $('#qs-dsl-wrap').hidden = mode !== 'dsl';
     view.querySelectorAll('input[name=qsmode]').forEach(r => { r.checked = r.value === mode; });
+    updateHint();
   }
   view.querySelectorAll('input[name=qsmode]').forEach(r => r.addEventListener('change', () => setQsMode(r.value)));
 
@@ -253,14 +287,36 @@ export async function renderBrowse(view, index) {
   function updateHint() {
     const h = $('#query-hint');
     const warn = state.conditions.some(c => c.op === 'contains');
+    // DSL 模式下每页条数最终来自 DSL 的 size（改工具条会同步改写它），
+    // 显式说明来源，否则用户在工具条与 DSL 两处看到的数字不同时会不知该改哪儿。
+    const dslSizeNote = state.tab === 'query' && state.qsMode === 'dsl'
+      && state.lastQuerySize && state.lastQuerySize !== state.pageSize
+      ? `<div>本次每页 ${fmtNum(state.lastQuerySize)} 条由 DSL 中的 size 决定；调整工具条的每页条数会同步改写 DSL</div>`
+      : '';
     h.innerHTML = (warn ? '<div class="hint-warn">“包含”用通配符实现，大索引上可能较慢</div>' : '') +
       (state.sampled ? '<div>该索引无 mapping，列由文档采样生成</div>' : '') +
+      dslSizeNote +
       `<div>共 ${meta.columns.length} 个字段 · max_result_window ${fmtNum(meta.maxResultWindow)}</div>`;
   }
 
   // ---------- 工具条 ----------
   $('#page-size').addEventListener('change', e => {
     state.pageSize = +e.target.value;
+    // DSL 模式下 size 就写在 DSL 里，改下拉框必须同步改写它，否则表格行数不变、
+    // 控件形同失效。此处只改 size，不动用户写的其他查询条件。
+    if (state.tab === 'query' && state.qsMode === 'dsl') {
+      const t = $('#dsl-input').value.trim();
+      if (t) {
+        try {
+          const o = JSON.parse(t);
+          if (o && typeof o === 'object' && !Array.isArray(o)) {
+            o.size = state.pageSize;
+            state.dslText = JSON.stringify(o, null, 2);
+            $('#dsl-input').value = state.dslText;
+          }
+        } catch { /* DSL 非合法 JSON 时留给 buildQuery 报错，此处不改写 */ }
+      }
+    }
     resetPages();
     load();
   });
@@ -271,6 +327,9 @@ export async function renderBrowse(view, index) {
   }));
   $('#btn-cols').addEventListener('click', () => openColumnSelector(''));
   $('#btn-newdoc').addEventListener('click', () => openNewDocDialog());
+  $('#vs-ai').addEventListener('click', () => {
+    location.hash = `#/ai/${encodeURIComponent(index)}`;
+  });
   $('#btn-mapping').addEventListener('click', async () => {
     try {
       const mapping = await get(`/api/indices/${encodeURIComponent(index)}/mapping`);
@@ -358,11 +417,23 @@ export async function renderBrowse(view, index) {
     let body;
     try {
       const q = buildQuery();
-      // DSL（完整请求体）自带 size 时本次执行优先用它；分页控件默认值不受影响
+      // DSL 自带 size 时本次执行优先用它；分页控件的默认值（state.pageSize）不受影响
       let size = state.pageSize;
       if (Number.isInteger(+q?.dsl?.size) && +q.dsl.size >= 1)
         size = Math.min(+q.dsl.size, meta.maxResultWindow);
       state.lastQuerySize = size;
+      // DSL 自带 size 时本次每页行数与下拉框偏好不同（取值优先级见上）：只同步显示，
+      // 不改 state.pageSize —— 那是用户偏好，不该被本次查询的 size 污染。
+      // 非预设档位临时补一个 option，避免 select 因找不到对应值而显示空白。
+      if (size !== state.pageSize) {
+        const sel = $('#page-size');
+        if (!Array.from(sel.options).some(o => +o.value === size))
+          sel.add(new Option(`${size} 条/页`, size));
+        sel.value = String(size);
+      }
+      updateHint();
+      // 记录最近一次实际执行的查询，供 AI 问答作为「用户当前关注范围」带入
+      lastQueries.set(index, q);
       body = {
         mode: start.mode,
         size,
@@ -642,15 +713,7 @@ export async function renderBrowse(view, index) {
 
   drawConditions();
   updateHint();
-  if (skipAutoLoad) {
-    // 不执行新查询：有上次查询结果就原样恢复表格，否则保持空提示
-    if (state.current) {
-      drawTable();
-      drawPager();
-      $('#docs-info').textContent =
-        state.current.total != null ? `共 ${fmtNum(state.current.total)} 条文档` : '';
-    }
-  } else load();
+  load();
 }
 
 // ---------- 弹窗工具 ----------

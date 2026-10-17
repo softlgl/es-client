@@ -1,6 +1,6 @@
-import { get, post, toast } from '../api.js?v=13';
-import { escapeHtml } from './indices.js?v=13';
-import { showModal, closeAllModals, modalRoot } from './browse.js?v=13';
+import { get, post, toast } from '../api.js?v=14';
+import { escapeHtml } from './indices.js?v=14';
+import { showModal, closeAllModals, modalRoot } from './browse.js?v=14';
 
 // ---------- AI 模型配置对话框（OpenAI 兼容接口，全局唯一入口在顶栏 AI 下拉） ----------
 export function openAiSettingsDialog(onSaved) {

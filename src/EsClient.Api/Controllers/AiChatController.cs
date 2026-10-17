@@ -32,7 +32,8 @@ public class AiChatController : ControllerBase
         _logger = logger;
     }
 
-    public record AskRequest(string? SessionId, string Question, bool? Thinking, string? TimeZone);
+    public record AskRequest(string? SessionId, string Question, bool? Thinking, string? TimeZone,
+        string? CurrentQuery);
 
     /// <summary>会话列表（不含轮次内容）。</summary>
     [HttpGet("/api/ai/chat/{index}")]
@@ -119,7 +120,7 @@ public class AiChatController : ControllerBase
             var messages = new List<object> { new { role = "system", content = BuildGenSystemPrompt() } };
             foreach (var t in historyTurns)
                 messages.Add(new { role = t.Role, content = t.Text });
-            messages.Add(new { role = "user", content = BuildGenUserPrompt(index, meta, samples, question, req.TimeZone) });
+            messages.Add(new { role = "user", content = BuildGenUserPrompt(index, meta, samples, question, req.TimeZone, req.CurrentQuery) });
 
             // 第一次生成 DSL
             var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
@@ -166,7 +167,7 @@ public class AiChatController : ControllerBase
             }
 
             // 表格数据（terms 分布 / 明细行 / 单值聚合），随回答落库以便历史重放
-            var tableData = BuildTableData(result!);
+            var tableData = BuildTableData(result!, body!, meta);
             if (tableData != null)
                 await WriteSseAsync("data", tableData, ct);
 
@@ -370,8 +371,33 @@ public class AiChatController : ControllerBase
         return outNode;
     }
 
-    /// <summary>为前端生成可重放的表格数据：terms 分布 → table；数值聚合 → value；明细命中 → table。</summary>
-    private static JsonObject? BuildTableData(JsonNode res)
+    /// <summary>
+    /// 在聚合定义树里按名称定位 terms 聚合的字段（支持 filter/nested 等包裹层）。
+    /// ES 的聚合响应只回 buckets、不回显聚合定义，字段名只能从生成阶段的 body 里取。
+    /// </summary>
+    private static string? FindTermsField(JsonNode? aggsNode, string name)
+    {
+        if (aggsNode is not JsonObject obj) return null;
+        foreach (var (k, v) in obj)
+        {
+            if (v is not JsonObject child) continue;
+            if (k == name && child["terms"]?["field"] is JsonValue fv && fv.TryGetValue<string>(out var fs))
+                return fs;
+            // 单层包裹（filter/nested 等）里再找同名聚合
+            if (child["aggs"] is JsonObject inner)
+            {
+                var hit = FindTermsField(inner, name);
+                if (hit != null) return hit;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// 为前端生成可重放的表格数据：terms 分布 → table；数值聚合 → value；明细命中 → table。
+    /// terms 分布会带上聚合字段（aggField）与其 nested 路径，前端据此把桶值做成下钻入口。
+    /// </summary>
+    private static JsonObject? BuildTableData(JsonNode res, JsonObject body, IndexMeta meta)
     {
         var aggs = res["aggregations"] as JsonObject;
         if (aggs != null)
@@ -382,18 +408,29 @@ public class AiChatController : ControllerBase
                 var rows = new JsonArray();
                 foreach (var b in buckets.Take(20))
                 {
-                    var key = b?["key"] is JsonValue kv
-                        ? kv.TryGetValue<string>(out var s) ? s : b["key"]!.ToJsonString().Trim('"')
-                        : b?["key"]?.ToJsonString() ?? "";
+                    // 桶值保留原始 JSON 类型（数值字段的 key 是数字），下钻构造 term 时才能对上
+                    var key = b?["key"]?.DeepClone() ?? JsonValue.Create("");
                     var docCount = b?["doc_count"]?.GetValue<long>() ?? 0;
                     rows.Add(new JsonArray([key, docCount.ToString("N0")]));
                 }
-                return new JsonObject
+                var table = new JsonObject
                 {
                     ["kind"] = "table",
                     ["columns"] = new JsonArray([name, "文档数"]),
                     ["rows"] = rows
                 };
+                var aggField = FindTermsField(body["aggs"] ?? body["aggregations"], name);
+                if (aggField != null)
+                {
+                    table["aggField"] = aggField;
+                    // nested 路径下的字段必须用 nested 查询包裹，否则 term 匹配不到嵌套文档
+                    var nested = meta.NestedPaths
+                        .Where(p => aggField == p || aggField.StartsWith(p + "."))
+                        .OrderByDescending(p => p.Length)
+                        .FirstOrDefault();
+                    if (nested != null) table["aggNested"] = nested;
+                }
+                return table;
             }
 
             // 无桶聚合：尝试单值指标（avg/max/min/sum/value_count）
@@ -437,7 +474,11 @@ public class AiChatController : ControllerBase
         {
             ["kind"] = "table",
             ["columns"] = new JsonArray(cols.Select(c => (JsonNode)c).ToArray()),
-            ["rows"] = tableRows
+            ["rows"] = tableRows,
+            // 带上命中总数与是否截断：问答表格只展示前若干行，用户需要一个基准
+            // 才能判断与数据浏览的结果是否一致（浏览页按同一份 DSL 执行）
+            ["total"] = res["hits"]?["total"]?["value"]?.DeepClone() ?? 0,
+            ["truncated"] = (res["hits"]?["total"]?["value"]?.GetValue<long>() ?? 0) > tableRows.Count
         };
     }
 
@@ -469,6 +510,8 @@ public class AiChatController : ControllerBase
         8. 多条件组合用 bool：且→must，或→should 并加 minimum_should_match:1，非→must_not。
         9. 标注「nested路径」的字段必须用 nested 查询/聚合包裹并指定 path。
         10. 结合上一轮问答历史理解指代（如「再细一点」「换成上个月」）。
+        11. 用户消息中若带有「用户当前正在数据浏览中查看的筛选条件」，那是他此刻关注的范围与口径：
+            问题未指明范围时沿用它，问题明确指向别的范围时以问题为准，不要被它绑住。
         示例：
         问题：各状态的订单数是多少
         输出：{"query":{"match_all":{}},"size":0,"aggs":{"status_count":{"terms":{"field":"status","size":20}}}}
@@ -515,7 +558,7 @@ public class AiChatController : ControllerBase
     }
 
     private static string BuildGenUserPrompt(string index, IndexMeta meta,
-        Dictionary<string, string[]> samples, string question, string? timeZone)
+        Dictionary<string, string[]> samples, string question, string? timeZone, string? currentQuery)
     {
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"目标索引：{index}（文档数 {meta.DocsCount.ToString("N0")}）");
@@ -544,6 +587,13 @@ public class AiChatController : ControllerBase
             if (samples.TryGetValue(field, out var vals))
                 line += $" | 示例值: {string.Join(", ", vals)}";
             sb.AppendLine(line);
+        }
+        if (!string.IsNullOrWhiteSpace(currentQuery))
+        {
+            // 浏览上下文：说明它是「参考」而非「要复现的目标」，否则模型容易直接照抄这份筛选条件，
+            // 导致用户问别的口径时仍被历史条件绑住
+            sb.AppendLine($"用户当前正在「数据浏览」中查看以下筛选条件（仅供理解他关注的范围与口径，不要机械照搬；本轮问题优先）：");
+            sb.AppendLine(currentQuery);
         }
         sb.AppendLine();
         sb.Append($"用户问题：{question}");

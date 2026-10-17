@@ -1,7 +1,7 @@
-import { get, post, toast } from '../api.js?v=13';
-import { escapeHtml } from './indices.js?v=13';
-import { showModal, closeAllModals, modalRoot } from './browse.js?v=13';
-import { openAiSettingsDialog } from './ai-settings.js?v=13';
+import { get, post, toast } from '../api.js?v=14';
+import { escapeHtml } from './indices.js?v=14';
+import { showModal, closeAllModals, modalRoot } from './browse.js?v=14';
+import { openAiSettingsDialog } from './ai-settings.js?v=14';
 
 // ---------- AI 生成查询弹窗：自然语言 → DSL → 填入查询语句框（DSL 模式） ----------
 export function openAiDialog({ index, applyDsl }) {

@@ -1,6 +1,6 @@
-import { post, get, toast, fmtNum } from '../api.js?v=13';
-import { escapeHtml } from './indices.js?v=13';
-import { showModal, closeAllModals } from './browse.js?v=13';
+import { post, get, toast, fmtNum } from '../api.js?v=14';
+import { escapeHtml } from './indices.js?v=14';
+import { showModal, closeAllModals } from './browse.js?v=14';
 
 export function openExportDialog({ index, columns, getQuery }) {
   const selected = new Set(columns.map(c => c.path));
