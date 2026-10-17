@@ -53,6 +53,18 @@ export async function renderBrowse(view, index) {
   state.meta = meta; // meta 每次重新拉取（服务端有缓存）
   if (isNew) stateCache.set(index, state);
 
+  // AI 问答「填入查询面板」：接管本次渲染，切到 DSL 模式并填入查询体。
+  // 填入后不自动执行，跳过渲染末尾的初始 load()，由用户确认后手动点「查询」
+  let skipAutoLoad = false;
+  const applyDsl = sessionStorage.getItem('ai-apply-dsl');
+  if (applyDsl) {
+    sessionStorage.removeItem('ai-apply-dsl');
+    state.tab = 'query';
+    state.qsMode = 'dsl';
+    state.dslText = applyDsl;
+    skipAutoLoad = true;
+  }
+
   // 无 mapping 时用首页文档采样兜底
   if (meta.columns.length === 0) state.sampled = true;
 
@@ -345,10 +357,16 @@ export async function renderBrowse(view, index) {
     const start = state.history[state.history.length - 1];
     let body;
     try {
+      const q = buildQuery();
+      // DSL（完整请求体）自带 size 时本次执行优先用它；分页控件默认值不受影响
+      let size = state.pageSize;
+      if (Number.isInteger(+q?.dsl?.size) && +q.dsl.size >= 1)
+        size = Math.min(+q.dsl.size, meta.maxResultWindow);
+      state.lastQuerySize = size;
       body = {
         mode: start.mode,
-        size: state.pageSize,
-        query: buildQuery(),
+        size,
+        query: q,
         sort: state.sort
       };
       if (start.mode === 'from') body.from = start.from;
@@ -578,11 +596,13 @@ export async function renderBrowse(view, index) {
     if (!res) { pager.innerHTML = ''; return; }
     const cur = state.history[state.history.length - 1];
     const canPrev = state.history.length > 1;
-    const canNext = !!res.nextAfter && res.rows.length === state.pageSize;
+    // DSL 自带 size 时本次每页行数与分页控件不同，用实际请求的值判断是否满页
+    const pageSize = state.lastQuerySize || state.pageSize;
+    const canNext = !!res.nextAfter && res.rows.length === pageSize;
 
     if (res.mode === 'from') {
-      const page = cur.from / state.pageSize + 1;
-      const maxPage = Math.max(1, Math.floor((meta.maxResultWindow - state.pageSize) / state.pageSize) + 1);
+      const page = cur.from / pageSize + 1;
+      const maxPage = Math.max(1, Math.floor((meta.maxResultWindow - pageSize) / pageSize) + 1);
       pager.innerHTML = `
         <button class="btn" id="pg-first" ${cur.from === 0 ? 'disabled' : ''}>首页</button>
         <button class="btn" id="pg-prev" ${canPrev ? '' : 'disabled'}>上一页</button>
@@ -598,8 +618,8 @@ export async function renderBrowse(view, index) {
       pager.querySelector('#pg-next').addEventListener('click', goNext);
       pager.querySelector('#pg-go').addEventListener('click', () => {
         const n = Math.max(1, +pager.querySelector('#pg-jump').value || 1);
-        const from = (n - 1) * state.pageSize;
-        if (from + state.pageSize > meta.maxResultWindow) {
+        const from = (n - 1) * pageSize;
+        if (from + pageSize > meta.maxResultWindow) {
           toast(`第 ${n} 页超出 max_result_window（${fmtNum(meta.maxResultWindow)}），请先用条件过滤或逐页翻到深处`, true);
           return;
         }
@@ -622,7 +642,15 @@ export async function renderBrowse(view, index) {
 
   drawConditions();
   updateHint();
-  load();
+  if (skipAutoLoad) {
+    // 不执行新查询：有上次查询结果就原样恢复表格，否则保持空提示
+    if (state.current) {
+      drawTable();
+      drawPager();
+      $('#docs-info').textContent =
+        state.current.total != null ? `共 ${fmtNum(state.current.total)} 条文档` : '';
+    }
+  } else load();
 }
 
 // ---------- 弹窗工具 ----------

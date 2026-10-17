@@ -3,6 +3,8 @@ import { renderConnect } from './views/connect.js?v=13';
 import { openConnectModal } from './views/connect.js?v=13';
 import { renderIndices, escapeHtml, confirmDeleteIndex } from './views/indices.js?v=13';
 import { renderBrowse, clearBrowseCache } from './views/browse.js?v=13';
+import { renderAiChat } from './views/ai-chat.js?v=13';
+import { openAiSettingsDialog } from './views/ai-settings.js?v=13';
 
 const view = document.getElementById('view');
 
@@ -122,10 +124,63 @@ const connDd = document.getElementById('conn-dropdown');
 connDd.querySelector('#conn-label').addEventListener('click', e => {
   e.stopPropagation();
   document.getElementById('conn-menu').classList.toggle('hidden');
+  closeAiMenu();
 });
 document.addEventListener('click', e => {
   if (!connDd.contains(e.target)) closeConnMenu();
 });
+
+// ---------- 顶栏 AI 模型下拉（全局唯一模型切换/配置入口） ----------
+const aiDd = document.getElementById('ai-dropdown');
+const aiLabel = document.getElementById('ai-label');
+const aiMenu = document.getElementById('ai-menu');
+
+function closeAiMenu() { aiMenu.classList.add('hidden'); }
+
+async function refreshAiLabel() {
+  try {
+    const s = await get('/api/ai/settings');
+    const active = (s.models || []).find(m => m.id === s.activeId);
+    aiLabel.textContent = active ? `✨ ${active.model}` : '✨ AI 未配置';
+  } catch { aiLabel.textContent = '✨ AI 未配置'; }
+}
+
+aiLabel.addEventListener('click', async e => {
+  e.stopPropagation();
+  if (!aiMenu.classList.contains('hidden')) { closeAiMenu(); return; }
+  closeConnMenu();
+  aiMenu.innerHTML = '<div class="conn-item">加载中…</div>';
+  aiMenu.classList.remove('hidden');
+  try {
+    const s = await get('/api/ai/settings');
+    const models = s.models || [];
+    aiMenu.innerHTML = (models.map(m => `
+      <div class="conn-item" data-ai-id="${escapeHtml(m.id)}">
+        <span class="ai-item-name">${escapeHtml(m.model)}</span>
+        ${m.id === s.activeId ? '<span class="ai-active">使用中</span>' : ''}
+      </div>`).join('') || '<div class="conn-item ai-menu-hint">尚未配置模型</div>')
+      + `<div class="ai-menu-divider"></div>
+         <div class="conn-item" id="ai-manage">⚙ 管理模型配置…</div>`;
+    aiMenu.querySelectorAll('[data-ai-id]').forEach(el => el.addEventListener('click', async () => {
+      try {
+        await post('/api/ai/settings/switch', { id: el.dataset.aiId });
+        toast('已切换模型');
+        closeAiMenu();
+        refreshAiLabel();
+      } catch (err) { toast(err.message, true); }
+    }));
+    aiMenu.querySelector('#ai-manage').addEventListener('click', () => {
+      closeAiMenu();
+      openAiSettingsDialog(refreshAiLabel);
+    });
+  } catch (err) {
+    aiMenu.innerHTML = `<div class="conn-item ai-menu-hint">${escapeHtml(err.message)}</div>`;
+  }
+});
+document.addEventListener('click', e => {
+  if (!aiDd.contains(e.target)) closeAiMenu();
+});
+refreshAiLabel();
 
 // ---------- 侧栏宽度（可拖拽） ----------
 const sidebarEl = document.getElementById('sidebar');
@@ -207,6 +262,7 @@ function drawSidebar(activeIndex) {
           <span class="sb-name">${escapeHtml(x.index)}</span>
           ${x.system ? '<span class="sys-badge">sys</span>' : ''}
           <span class="sb-count">${fmtNum(x.docsCount)}</span>
+          <button class="sb-ai" data-ai="${escapeHtml(x.index)}" title="AI 问答">✨</button>
           <button class="sb-del" data-del="${escapeHtml(x.index)}" title="删除索引">×</button>
         </div>`).join('') || `<div class="sb-empty">无匹配索引</div>`}
     </div>`;
@@ -225,6 +281,10 @@ function drawSidebar(activeIndex) {
     drawSidebar(activeIndex);
   });
   sb.querySelector('#sb-refresh').addEventListener('click', () => refreshSidebar(activeIndex));
+  sb.querySelectorAll('.sb-ai').forEach(btn => btn.addEventListener('click', e => {
+    e.stopPropagation();
+    location.hash = `#/ai/${encodeURIComponent(btn.dataset.ai)}`;
+  }));
   sb.querySelectorAll('.sb-del').forEach(btn => btn.addEventListener('click', e => {
     e.stopPropagation();
     const name = btn.dataset.del;
@@ -284,14 +344,16 @@ export async function route() {
     }
     sb.classList.remove('hidden');
     resizerEl.classList.remove('hidden');
-    if (h.startsWith('#/browse/')) {
-      const idx = decodeURIComponent(h.slice('#/browse/'.length));
+    if (h.startsWith('#/browse/') || h.startsWith('#/ai/')) {
+      const isAi = h.startsWith('#/ai/');
+      const idx = decodeURIComponent(h.slice((isAi ? '#/ai/' : '#/browse/').length));
       if (forceSidebar || sb.dataset.active !== idx) {
         sb.dataset.active = idx;
         forceSidebar = false;
         if (sidebarLoaded) drawSidebar(idx); else await refreshSidebar(idx);
       }
-      renderBrowse(view, idx);
+      if (isAi) await renderAiChat(view, idx);
+      else renderBrowse(view, idx);
     } else {
       // #/indices、空 hash 或未知 hash：已连接时统一落到索引列表
       if (h !== '#/indices') location.hash = '#/indices';

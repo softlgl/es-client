@@ -1,6 +1,6 @@
 # es-client
 
-轻量级 Elasticsearch 数据浏览与导出工具：连接集群、浏览索引与文档、构建查询、用自然语言生成 DSL、导出 Excel。
+轻量级 Elasticsearch 数据浏览与导出工具：连接集群、浏览索引与文档、构建查询、用自然语言生成 DSL、对索引数据 AI 问答、导出 Excel。
 
 后端为 ASP.NET Core（.NET 10），前端为无框架的原生 JavaScript，全部由后端静态托管，单命令即可启动。
 
@@ -34,6 +34,7 @@
   - query_string 语法
   - DSL(JSON)：直接编写完整查询请求体
   - **AI 生成**：自然语言 → DSL，支持 OpenAI 兼容接口的多模型配置与思考模式
+- **AI 问答**：针对当前索引数据提问（计数、分布、汇总等），AI 生成查询后执行，流式回答并附结果表格；每个索引支持多会话，历史保存在服务端；回答中的查询 DSL 可一键填入查询面板
 - **导出 Excel**：基于 MiniExcel 流式写出，可勾选导出列、设置行数上限（单表上限 1,048,575 行）、可选包含 `_id` 列，后台任务执行、随时取消
 
 ## 快速开始
@@ -64,7 +65,7 @@ dotnet run --project src/Seeder -- --host http://localhost:9200 --count 120000
 
 ## AI 配置
 
-点击查询面板的「✨ AI 生成」→「修改 AI 设置」，配置任意 OpenAI 兼容接口（如 DeepSeek、通义千问）的 BaseUrl / ApiKey / 模型名，支持保存多个模型配置并随时切换。
+点击**顶栏的 ✨ 模型标签** →「⚙ 管理模型配置…」，配置任意 OpenAI 兼容接口（如 DeepSeek、通义千问）的 BaseUrl / ApiKey / 模型名，支持保存多个模型配置并随时切换；「AI 生成查询」与「AI 问答」共用此处配置的当前模型。
 
 ## 配置说明
 
@@ -72,6 +73,7 @@ dotnet run --project src/Seeder -- --host http://localhost:9200 --count 120000
 
 - `connections.json`：ES 连接（含用户名/密码）
 - `ai-settings.json`：AI 模型配置（含 ApiKey）
+- `chats/`：AI 问答会话历史（按索引分文件）
 
 > ⚠️ 该目录包含明文凭据，请勿分享给他人。
 

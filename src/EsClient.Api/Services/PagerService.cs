@@ -75,11 +75,17 @@ public class PagerService
 
         var query = _queryBuilder.Build(req.Query, colMap);
 
+        // DSL 模式（AI 生成/用户直写完整请求体）：表头无显式排序时，尊重 DSL 内的 sort
+        JsonArray? dslSort = null;
+        if (query != null && req.Query?.Dsl?["sort"] is JsonNode dsn &&
+            (req.Sort == null || string.IsNullOrEmpty(req.Sort.Field)))
+            dslSort = NormalizeSort(dsn);
+
         var body = new JsonObject
         {
             ["size"] = size,
             ["track_total_hits"] = false,
-            ["sort"] = BuildSort(sortField, sortDir)
+            ["sort"] = dslSort ?? BuildSort(sortField, sortDir)
         };
         if (query != null) body["query"] = query.DeepClone();
 
@@ -119,6 +125,22 @@ public class PagerService
 
         var last = rows.Count > 0 ? rows[^1].Sort : null;
         return new BrowseResponse(rows, total, mode, from, last);
+    }
+
+    /// <summary>规范化 DSL 内的 sort（字符串 / 快捷对象 / 完整对象数组均可），追加 _doc 兜底保证游标翻页稳定。</summary>
+    private static JsonArray? NormalizeSort(JsonNode? node)
+    {
+        JsonArray arr = node switch
+        {
+            JsonArray a => (JsonArray)a.DeepClone(),
+            JsonValue v when v.TryGetValue<string>(out var s) => new JsonArray(s),
+            JsonObject o => new JsonArray(o.DeepClone()),
+            _ => new JsonArray()
+        };
+        if (arr.Count == 0) return null;
+        if (arr[^1] is not JsonObject last || last["_doc"] == null)
+            arr.Add(new JsonObject { ["_doc"] = "asc" });
+        return arr;
     }
 
     private static JsonArray BuildSort(string? field, string dir)

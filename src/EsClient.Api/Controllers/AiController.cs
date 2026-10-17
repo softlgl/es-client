@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -12,18 +11,18 @@ namespace EsClient.Api.Controllers;
 public class AiController : ControllerBase
 {
     private readonly AiSettingsStore _ai;
+    private readonly AiClient _aiClient;
     private readonly ConnectionStore _store;
     private readonly MappingService _mapping;
-    private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<AiController> _logger;
 
-    public AiController(AiSettingsStore ai, ConnectionStore store, MappingService mapping,
-        IHttpClientFactory httpFactory, ILogger<AiController> logger)
+    public AiController(AiSettingsStore ai, AiClient aiClient, ConnectionStore store, MappingService mapping,
+        ILogger<AiController> logger)
     {
         _ai = ai;
+        _aiClient = aiClient;
         _store = store;
         _mapping = mapping;
-        _httpFactory = httpFactory;
         _logger = logger;
     }
 
@@ -51,6 +50,21 @@ public class AiController : ControllerBase
         }, ct);
         var total = res["hits"]?["total"]?["value"]?.GetValue<long>() ?? 0;
         return Ok(new { total });
+    }
+
+    // ---------- 解析与安全约束 ----------
+
+    /// <summary>
+    /// 取历史末尾 maxTurns 个完整轮次（以 assistant 为轮次边界向前成对取）。
+    /// 按条数截断会把「用户需求 / 模型输出」切成半轮，多轮修正的指代就失去了上下文。
+    /// </summary>
+    private static IEnumerable<ChatMsg> TakeLastTurns(List<ChatMsg> history, int maxTurns)
+    {
+        var end = history.FindLastIndex(m => m.Role == "assistant") + 1;
+        if (end == 0) end = history.Count; // 无 assistant 记录则退化为按条数取
+        var start = Math.Max(0, end - maxTurns * 2);
+        return history.Skip(start).Take(end - start)
+            .Where(m => m.Role is "user" or "assistant" && !string.IsNullOrWhiteSpace(m.Content));
     }
 
     private static readonly string[] QueryRootKeys =
@@ -167,23 +181,22 @@ public class AiController : ControllerBase
 
             var samplingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             samplingCts.CancelAfter(TimeSpan.FromSeconds(5)); // 采样失败不阻塞生成
-            var samples = await SampleFieldValuesAsync(client, req.Index, meta, samplingCts.Token);
+            var samples = await _aiClient.SampleFieldValuesAsync(client, req.Index, meta, samplingCts.Token);
 
             var messages = new List<object>
             {
                 new { role = "system", content = BuildSystemPrompt() }
             };
-            foreach (var m in (req.History ?? []).TakeLast(8))
-            {
-                if (m.Role is "user" or "assistant" && !string.IsNullOrWhiteSpace(m.Content))
-                    messages.Add(new { role = m.Role, content = m.Content });
-            }
+            // 多轮修正：按完整轮次（user→assistant）成对截断，避免只剩半轮使指代失效
+            foreach (var m in TakeLastTurns(req.History ?? [], 4))
+                messages.Add(new { role = m.Role, content = m.Content });
             // 错误自愈：把上一次的失败原因回传给模型，让它自行修正
             if (!string.IsNullOrWhiteSpace(req.LastError))
                 messages.Add(new { role = "user", content = $"上一次生成失败，错误信息：{req.LastError}。请修正后重新输出，仍须遵守全部规则。" });
             messages.Add(new { role = "user", content = BuildUserPrompt(req.Index, meta, samples, req.Prompt.Trim(), req.TimeZone) });
 
-            var content = await StreamUpstreamAsync(messages, req.Thinking == true, ct);
+            var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
+                (type, text) => WriteSseAsync(type, new { text }, ct), ct);
             var dsl = ExtractQueryDsl(content);
             if (dsl != null)
                 await WriteSseAsync("done", new { dsl }, ct);
@@ -212,93 +225,8 @@ public class AiController : ControllerBase
         }
     }
 
-    /// <summary>以 stream 模式调用上游 OpenAI 兼容接口，逐块转发 reasoning/content，返回完整 content。thinking 为 true 时优先使用配置的思考模型。</summary>
-    private async Task<string> StreamUpstreamAsync(List<object> messages, bool thinking, CancellationToken ct)
-    {
-        var s = _ai.Get();
-        var http = _httpFactory.CreateClient("ai");
-        http.Timeout = Timeout.InfiniteTimeSpan; // 读流时长自行控制
-
-        var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        streamCts.CancelAfter(TimeSpan.FromMinutes(4));
-
-        var model = thinking && !string.IsNullOrWhiteSpace(s.ThinkingModel) ? s.ThinkingModel : s.Model;
-        using var reqMsg = new HttpRequestMessage(HttpMethod.Post, $"{s.BaseUrl.TrimEnd('/')}/chat/completions");
-        reqMsg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", s.ApiKey);
-        var body = new JsonObject
-        {
-            ["model"] = model,
-            ["messages"] = new JsonArray([.. messages.Select(m => JsonSerializer.SerializeToNode(m))]),
-            ["temperature"] = 0.2,
-            ["stream"] = true
-        };
-        reqMsg.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-
-        HttpResponseMessage res;
-        try
-        {
-            res = await http.SendAsync(reqMsg, HttpCompletionOption.ResponseHeadersRead, streamCts.Token);
-        }
-        catch (HttpRequestException ex)
-        {
-            throw new EsException($"无法连接 AI 服务（{s.BaseUrl}）：{ex.Message}", 502);
-        }
-        catch (TaskCanceledException) when (!streamCts.Token.IsCancellationRequested)
-        {
-            throw new EsException("AI 服务响应超时，请检查接口地址或稍后重试", 504);
-        }
-
-        if (!res.IsSuccessStatusCode)
-        {
-            var text = await res.Content.ReadAsStringAsync(streamCts.Token);
-            var detail = TryExtractOpenAiError(text) ?? text;
-            res.Dispose();
-            throw new EsException(
-                $"AI 服务返回错误（{(int)res.StatusCode}）：{detail[..Math.Min(detail.Length, 200)]}", 502);
-        }
-
-        var contentBuilder = new StringBuilder();
-        try
-        {
-            using var stream = await res.Content.ReadAsStreamAsync(streamCts.Token);
-            using var reader = new StreamReader(stream);
-            while (await reader.ReadLineAsync(streamCts.Token) is { } line)
-            {
-                if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
-                var data = line[5..].Trim();
-                if (data == "[DONE]") break;
-
-                JsonNode? chunk;
-                try { chunk = JsonNode.Parse(data); } catch { continue; }
-
-                // qwen 等会先发一个 choices 为空数组的 chunk，需跳过
-                var choices = chunk?["choices"] as JsonArray;
-                var delta = choices is { Count: > 0 } ? choices[0]?["delta"] : null;
-                if (delta == null) continue;
-
-                // 推理模型（DeepSeek-R1 等）的思考过程字段；qwen 会显式发 "content": null，须安全取值
-                var reasoning = NodeStr(delta["reasoning_content"]) ?? NodeStr(delta["reasoning"]);
-                if (!string.IsNullOrEmpty(reasoning))
-                    await WriteSseAsync("reasoning", new { text = reasoning }, streamCts.Token);
-
-                var piece = NodeStr(delta["content"]);
-                if (!string.IsNullOrEmpty(piece))
-                {
-                    contentBuilder.Append(piece);
-                    await WriteSseAsync("content", new { text = piece }, streamCts.Token);
-                }
-            }
-        }
-        finally
-        {
-            res.Dispose();
-        }
-        return contentBuilder.ToString();
-    }
-
     /// <summary>安全读取 JsonNode 字符串（缺失 / JSON null / 非字符串均返回 null）。</summary>
-    private static string? NodeStr(JsonNode? node) =>
-        node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+    private static string? NodeStr(JsonNode? node) => AiClient.NodeStr(node);
 
     private async Task WriteSseAsync(string type, object payload, CancellationToken ct)
     {
@@ -306,92 +234,6 @@ public class AiController : ControllerBase
         node["type"] = type;
         await Response.WriteAsync($"data: {node.ToJsonString()}\n\n", ct);
         await Response.Body.FlushAsync(ct);
-    }
-
-    /// <summary>对可精确匹配的字段做 terms 聚合采样（每字段 top 5），供 AI 选择真实存在的值。</summary>
-    private async Task<Dictionary<string, string[]>> SampleFieldValuesAsync(
-        EsHttpClient client, string index, IndexMeta meta, CancellationToken ct)
-    {
-        try
-        {
-            var fields = meta.Columns
-                .Where(c => c.Type is "keyword" or "ip" or "version" ||
-                            (c.Type == "text" && c.KeywordPath != null))
-                .Select(c => c.KeywordPath ?? c.Path)
-                .Distinct()
-                .Take(12)
-                .ToList();
-            var numeric = meta.Columns
-                .Where(c => c.Type is "long" or "integer" or "short" or "byte" or "double" or "float" or "half_float" or "scaled_float")
-                .Select(c => c.Path)
-                .Take(4);
-            fields.AddRange(numeric.Except(fields));
-            var dates = meta.Columns
-                .Where(c => c.Type is "date" or "date_nanos")
-                .Select(c => c.Path)
-                .Take(3);
-            fields.AddRange(dates.Except(fields));
-            if (fields.Count == 0) return new Dictionary<string, string[]>();
-
-            var dateSet = dates.ToHashSet();
-            var aggs = new JsonObject();
-            foreach (var f in fields)
-                aggs[$"a{aggs.Count}"] = dateSet.Contains(f)
-                    ? new JsonObject { ["stats"] = new JsonObject { ["field"] = f } }
-                    : new JsonObject { ["terms"] = new JsonObject { ["field"] = f, ["size"] = 5 } };
-
-            var res = await client.SearchAsync(index,
-                new JsonObject { ["size"] = 0, ["aggs"] = aggs }, ct);
-
-            var dict = new Dictionary<string, string[]>();
-            var i = 0;
-            foreach (var f in fields)
-            {
-                if (dateSet.Contains(f))
-                {
-                    var stats = res?["aggregations"]?[$"a{i}"] as JsonObject;
-                    var min = EpochToIso(stats?["min"]);
-                    var max = EpochToIso(stats?["max"]);
-                    if (min != null && max != null) dict[f] = [$"{min} ~ {max}"];
-                }
-                else
-                {
-                    var buckets = res?["aggregations"]?[$"a{i}"]?["buckets"] as JsonArray;
-                    var vals = buckets?.Select(b => b?["key"])
-                        .Select(k => k is JsonValue v
-                            ? v.TryGetValue<string>(out var s) ? s : k?.ToJsonString().Trim('"') ?? ""
-                            : k?.ToJsonString() ?? "")
-                        .Where(s => s.Length > 0)
-                        .Take(5)
-                        .ToArray() ?? [];
-                    if (vals.Length > 0) dict[f] = vals;
-                }
-                i++;
-            }
-            return dict;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "字段值采样失败（不影响生成）：{Index}", index);
-            return new Dictionary<string, string[]>();
-        }
-    }
-
-    /// <summary>把 ES stats 聚合返回的时间数值（epoch 毫秒/纳秒）转为 ISO 字符串。</summary>
-    private static string? EpochToIso(JsonNode? node)
-    {
-        if (node is not JsonValue v) return null;
-        double n;
-        try
-        {
-            if (v.TryGetValue<double>(out var d)) n = d;
-            else if (v.TryGetValue<long>(out var l)) n = l;
-            else return null;
-        }
-        catch { return null; }
-        if (double.IsNaN(n) || n <= 0) return null;
-        var ms = n > 1e14 ? n / 1e6 : n; // 纳秒 → 毫秒
-        return DateTimeOffset.FromUnixTimeMilliseconds((long)ms).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ");
     }
 
     private static string BuildSystemPrompt() => """
@@ -402,8 +244,7 @@ public class AiController : ControllerBase
         3. 类型选型：keyword/ip/version 用 term（多值用 terms）；text 用 match / match_phrase；数值与日期范围用 range；判断字段是否存在用 exists。
         4. text 字段需精确匹配时，若字段列表标注了 keyword 子字段（形如 path.keyword），改用该子字段做 term/terms。
         5. 中文时间词按以下映射转成 ES now 表达式（由 ES 执行时计算，禁止换算为绝对日期）：
-           今天→now/d  昨天→now-1d/d  本周→now-1w/w  本月→now/M  今年→now-1y/y
-           最近N天→now-Nd/d  近一个月→now-1M/M  近一年→now-1y/y  N天前→now-Nd/d
+        """ + AiPrompts.TimeMapping + """
            用户给出绝对日期时使用标准 ISO 格式（如 2024-01-01 或带时间的 ISO 格式）。
         6. 多条件组合用 bool：且→must，或→should 并加 minimum_should_match:1，非→must_not。
         7. 用户明确要求排序/聚合时才添加 sort/aggs 子句，否则只输出 query。
@@ -456,17 +297,10 @@ public class AiController : ControllerBase
         return sb.ToString();
     }
 
-    private static string? TryExtractOpenAiError(string body)
-    {
-        try
-        {
-            var n = JsonNode.Parse(body);
-            return n?["error"]?["message"]?.GetValue<string>() ?? n?["message"]?.GetValue<string>();
-        }
-        catch { return null; }
-    }
-
-    /// <summary>从模型输出中提取查询 DSL：剥 markdown 围栏 → 截取 JSON → 规范为 { query: ... }。</summary>
+    /// <summary>
+    /// 从模型输出中提取查询 DSL：剥 markdown 围栏 → 截取 JSON → 规范为完整请求体。
+    /// query/sort/size/aggs/_source 等顶层键全部保留，避免丢失模型的排序与取数条数语义。
+    /// </summary>
     private static JsonObject? ExtractQueryDsl(string content)
     {
         var text = content.Trim();
@@ -491,11 +325,26 @@ public class AiController : ControllerBase
         catch { return null; }
         if (node is not JsonObject obj) return null;
 
-        if (obj["query"] is JsonObject q) return new JsonObject { ["query"] = q.DeepClone() };
+        // 已含 query：整体保留（sort/size/aggs 等顶层键随行）
+        if (obj["query"] is JsonObject)
+            return (JsonObject)obj.DeepClone();
 
-        // 裸 query 子句：包含常见查询关键字时包一层 query
+        // 裸 query 子句：包一层 query，同级 sort 一并提级
         if (obj.Any(kvp => QueryRootKeys.Contains(kvp.Key)))
-            return new JsonObject { ["query"] = obj.DeepClone() };
+        {
+            JsonNode? sort = null;
+            if (obj["sort"] != null) { sort = obj["sort"]!.DeepClone(); obj.Remove("sort"); }
+            var wrapped = new JsonObject { ["query"] = obj.DeepClone() };
+            if (sort != null) wrapped["sort"] = sort;
+            return wrapped;
+        }
+
+        // 模型省略 query 只给了 sort/size/aggs：补 match_all 保住语义
+        if (obj.Any(kvp => kvp.Key is "sort" or "size" or "aggs" or "aggregations" or "_source"))
+        {
+            obj["query"] = new JsonObject { ["match_all"] = new JsonObject() };
+            return obj;
+        }
 
         return null;
     }

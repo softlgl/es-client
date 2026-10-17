@@ -8,6 +8,8 @@ builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<ConnectionStore>();
 builder.Services.AddSingleton<AiSettingsStore>();
+builder.Services.AddSingleton<AiClient>();
+builder.Services.AddSingleton<ChatStore>();
 builder.Services.AddSingleton<MappingService>();
 builder.Services.AddSingleton<QueryBuilder>();
 builder.Services.AddSingleton<PagerService>();
