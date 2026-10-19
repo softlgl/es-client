@@ -137,6 +137,17 @@ internal static class AiDslGuard
         return (obj, null);
     }
 
+    /// <summary>
+    /// 问答链路：识别模型标记的「无需查询」。生成阶段允许模型对与索引数据无关的问题
+    /// （常识/观点/闲聊）输出 {"no_query":true}，控制器据此跳过执行、改用通用回答。
+    /// 只认显式布尔 true，避免把缺少 query/aggs 的残缺 DSL 误判为免查询。
+    /// </summary>
+    public static bool IsNoQueryMarker(string content)
+    {
+        var (obj, _) = TryParseObject(content);
+        return obj?["no_query"] is JsonValue v && v.TryGetValue<bool>(out var flag) && flag;
+    }
+
     private static readonly string[] QueryRootKeys =
     [
         "bool", "match", "match_phrase", "match_phrase_prefix", "multi_match", "term", "terms",

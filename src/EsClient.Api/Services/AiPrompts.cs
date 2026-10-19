@@ -68,7 +68,7 @@ public static class AiPrompts
         规则：
         1. 只输出一个 JSON 对象，禁止任何解释文字、markdown 围栏或注释。
         2. 顶层只能包含：query、aggs、size、sort、_source。禁止 script、suggest、knn、runtime_mappings。
-        3. 统计类问题（多少、平均、总和、分布、占比、Top N）：size 设为 0，用 aggs 表达；terms 聚合默认 size 20，最大不超过 50。
+        3. 统计类问题（多少、平均、总和、分布、占比、Top N）：size 设为 0，用 aggs 表达；terms 聚合默认 size 20，最大不超过 50。date_histogram 必须带 "format"（按天及以上用 "yyyy-MM-dd"，按小时/分钟用 "yyyy-MM-dd HH:mm"），否则响应里的桶键只有时间戳。
         4. 明细类问题（列出、查看、举例）：size 设 1~10，必要时加 sort（如 {"createTime":{"order":"desc"}}），_source 只保留问题相关字段。
         5. 只能使用「字段列表」中给出的字段名（完整路径），禁止编造字段。
         6. 类型选型：keyword/ip/version 用 term（多值用 terms）；text 用 match / match_phrase，需精确匹配时若标注了 keyword 子字段则改用之；数值与日期范围用 range；判断存在用 exists。
@@ -80,6 +80,8 @@ public static class AiPrompts
         10. 结合上一轮问答历史理解指代（如「再细一点」「换成上个月」）。
         11. 用户消息中若带有「用户当前正在数据浏览中查看的筛选条件」，那是他此刻关注的范围与口径：
             问题未指明范围时沿用它，问题明确指向别的范围时以问题为准，不要被它绑住。
+        12. 若问题与「字段列表」里的数据无关（常识、经验观点、闲聊、对 ES 或本工具用法的咨询等），
+            不要生成查询，只输出 {"no_query":true}。
         示例：
         问题：各状态的订单数是多少
         输出：{"query":{"match_all":{}},"size":0,"aggs":{"status_count":{"terms":{"field":"status","size":20}}}}
@@ -87,6 +89,20 @@ public static class AiPrompts
         输出：{"query":{"range":{"createdAt":{"gte":"now-1M/M","lte":"now/M","time_zone":"+08:00"}}},"size":0,"aggs":{"avg_amount":{"avg":{"field":"amount"}}}}
         问题：金额最高的 5 笔订单，列出状态和金额
         输出：{"query":{"match_all":{}},"size":5,"sort":[{"amount":{"order":"desc"}}],"_source":["status","amount"]}
+        """;
+
+    /// <summary>
+    /// 免查询直接回答的系统提示词：模型在生成阶段判定问题与索引数据无关时
+    /// （输出 {"no_query":true}），由本提示词接管回答。与总结阶段的关键区别是
+    /// 不禁止观点表达——那个提示词强制「数字只能来自查询结果」，用在常识/经验类
+    /// 问题上会让模型无法作答。
+    /// </summary>
+    public static string ChatDirectSystem() => """
+        你是运行在 Elasticsearch 数据客户端里的 AI 助手。用户本轮问题与索引数据无关（常识、经验观点、闲聊、工具用法咨询等），不需要查询数据。
+        规则：
+        1. 直接用中文简洁回答，控制在 200 字以内。
+        2. 可以给出经验性观点，但明确说明这是通用经验判断，不是对该索引统计出来的结论。
+        3. 不要编造看似来自查询结果的数字。若用户其实是在问索引里的数据，提醒他换更具体的问法（如「各状态订单数是多少」）。
         """;
 
     public static string ChatSummarizeSystem() => """

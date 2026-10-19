@@ -312,6 +312,7 @@ export async function renderAiChat(view, index) {
     if (!question) { toast('请先输入问题', true); return; }
     if (streaming) { abortCtl?.abort(); return; }
 
+    input.value = ''; // 已取到问题，清空输入框（放在 streaming 检查之后，点「停止」不会误清）
     setStreaming(true);
     abortCtl = new AbortController();
 
@@ -341,6 +342,7 @@ export async function renderAiChat(view, index) {
     const answerEl = live.querySelector('.chat-answer');
     let reasoningShown = false;
     let dslText = null;
+    let direct = false;   // 免查询直接回答：之后的 content 进回答气泡而非 DSL 预览
     let data = null;
     let answer = '';
 
@@ -371,7 +373,7 @@ export async function renderAiChat(view, index) {
           reasonEl.textContent += ev.text || '';
           reasonEl.scrollTop = reasonEl.scrollHeight;
           autoScroll();
-        } else if (ev.type === 'content' && !dslText) {
+        } else if (ev.type === 'content' && !dslText && !direct) {
           // 第一阶段：DSL 生成预览
           genEl.classList.remove('hidden');
           genEl.textContent += ev.text || '';
@@ -380,6 +382,11 @@ export async function renderAiChat(view, index) {
           dslText = JSON.stringify(ev.dsl, null, 2);
           genEl.remove();
           statusEl.innerHTML = '<span class="spinner"></span>正在执行查询…';
+        } else if (ev.type === 'direct') {
+          // 问题与索引数据无关：撤掉 DSL 预览，后续 content 转进回答气泡
+          direct = true;
+          genEl.remove();
+          statusEl.innerHTML = '<span class="spinner"></span>正在回答…';
         } else if (ev.type === 'data') {
           data = ev;
           dataEl.innerHTML = dataTableHtml(ev);

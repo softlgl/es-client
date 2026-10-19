@@ -67,6 +67,8 @@ public class AiChatController : ControllerBase
     /// <summary>
     /// 提问（SSE 流式）。事件序列：reasoning* / content*（生成 DSL 阶段）→ dsl{dsl} →
     /// data{表格数据} → reasoning*/content*（总结阶段）→ done{sessionId,title,turn} 或 error{error}。
+    /// 与索引数据无关的问题（常识/观点/闲聊）在生成阶段以 {"no_query":true} 免查询，
+    /// 事件序列为 content* → direct{} → content*（直接回答）→ done，不产生 dsl/data。
     /// </summary>
     [HttpPost("/api/ai/chat/{index}")]
     public async Task Ask(string index, [FromBody] AskRequest req, CancellationToken ct)
@@ -121,8 +123,39 @@ public class AiChatController : ControllerBase
 
             // 第一次生成 DSL
             var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
-                (type, text) => WriteSseAsync(type, new { text }, ct), ct);
+                (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true);
             var (body, parseError) = AiDslGuard.ExtractSearchBody(content);
+
+            // 常识/观点/闲聊等与索引数据无关的问题：模型标记免查询，直接回答。
+            // 不走查数链路——否则既浪费一次 ES 查询，回答还会被总结提示词
+            // （数字只能来自结果 JSON）绑死，观点类问题无法作答
+            if (body == null && AiDslGuard.IsNoQueryMarker(content))
+            {
+                // 通知前端撤掉 DSL 预览，后续 content 转进回答气泡
+                await WriteSseAsync("direct", new { }, ct);
+                var directMessages = new List<object> { new { role = "system", content = AiPrompts.ChatDirectSystem() } };
+                foreach (var t in historyTurns)
+                    directMessages.Add(new { role = t.Role, content = t.Text });
+                directMessages.Add(new { role = "user", content = question });
+                var directAnswer = await _aiClient.StreamAsync(directMessages, false,
+                    (type, text) => type == "content" ? WriteSseAsync("content", new { text }, ct) : Task.CompletedTask, ct);
+                if (string.IsNullOrWhiteSpace(directAnswer))
+                    directAnswer = "（AI 未给出回答）";
+
+                var directNow = DateTimeOffset.Now;
+                var directSaved = await _chats.AddTurnsAsync(index, sessionId,
+                [
+                    new ChatStore.ChatTurn("user", question, null, null, directNow),
+                    new ChatStore.ChatTurn("assistant", directAnswer, null, null, directNow)
+                ]);
+                await WriteSseAsync("done", new
+                {
+                    sessionId = directSaved.Id,
+                    title = directSaved.Title,
+                    turn = new { role = "assistant", text = directAnswer, dsl = (string?)null, data = (JsonNode?)null, time = directNow }
+                }, ct);
+                return;
+            }
 
             // 执行；失败把 ES 报错喂回去重新生成一次
             JsonNode? result = null;
@@ -134,7 +167,7 @@ public class AiChatController : ControllerBase
                     await WriteSseAsync("status", new { text = $"查询执行失败（{execError}），正在让 AI 修正重试…" }, ct);
                     messages.Add(new { role = "user", content = $"上一次生成的 DSL 执行失败，错误信息：{execError}。请修正后重新输出，仍只输出一个 JSON 对象。" });
                     content = await _aiClient.StreamAsync(messages, req.Thinking == true,
-                        (type, text) => WriteSseAsync(type, new { text }, ct), ct);
+                        (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true);
                     (body, parseError) = AiDslGuard.ExtractSearchBody(content);
                 }
 
@@ -278,8 +311,64 @@ public class AiChatController : ControllerBase
     }
 
     /// <summary>
-    /// 为前端生成可重放的表格数据：terms 分布 → table；数值聚合 → value；明细命中 → table。
-    /// terms 分布会带上聚合字段（aggField）与其 nested 路径，前端据此把桶值做成下钻入口。
+    /// 从首个桶探测单值指标列：cardinality/avg/sum/min/max/value_count 等子聚合的响应带 "value"，
+    /// 取子聚合名作列名（如 cardinality 的 distinct_ip → 列名 distinct_ip）。桶内嵌 buckets
+    /// （多级 terms/date_histogram）的跳过。一个都没有时调用方退回 doc_count。
+    /// </summary>
+    private static List<string> PickMetricNames(JsonNode? firstBucket)
+    {
+        var names = new List<string>();
+        if (firstBucket is not JsonObject obj) return names;
+        foreach (var (k, v) in obj)
+        {
+            if (k is "key" or "key_as_string" or "doc_count") continue;
+            if (v is JsonObject vo && vo["value"] != null)
+                names.Add(k);
+        }
+        return names;
+    }
+
+    /// <summary>单值指标值格式化：整数加千分位；小数原样保留精度（avg 等）。</summary>
+    private static JsonNode FormatMetricValue(JsonNode? value)
+    {
+        if (value is JsonValue v)
+        {
+            if (v.TryGetValue<long>(out var l)) return JsonValue.Create(l.ToString("N0"));
+            var s = v.ToJsonString().Trim('"');
+            if (!string.IsNullOrEmpty(s)) return JsonValue.Create(s);
+        }
+        return JsonValue.Create("");
+    }
+
+    /// <summary>
+    /// 取该聚合对应 date_histogram 的日期格式（支持 filter/nested 等单层包裹），不是则返回 null。
+    /// 用于桶键缺 key_as_string 时兜底把 epoch 毫秒格式化为日期——模型偶尔不遵守提示词里的
+    /// format 规则，表格会退化成时间戳。粒度细到小时/分钟时才带时分。
+    /// </summary>
+    private static string? DateHistogramFormat(JsonNode? aggsNode, string name)
+    {
+        if (aggsNode is not JsonObject obj) return null;
+        foreach (var (k, v) in obj)
+        {
+            if (v is not JsonObject child) continue;
+            if (k == name && child["date_histogram"] is JsonObject dh)
+                return IsSubDay(dh["calendar_interval"]) ? "yyyy-MM-dd HH:mm" : "yyyy-MM-dd";
+            // 单层包裹（filter/nested 等）里再找同名聚合
+            if (child["aggs"] is JsonObject inner && DateHistogramFormat(inner, name) is { } innerFmt)
+                return innerFmt;
+        }
+        return null;
+
+        static bool IsSubDay(JsonNode? interval) =>
+            interval is JsonValue iv && iv.TryGetValue<string>(out var s) &&
+            s is "second" or "minute" or "hour" or "1m" or "5m" or "15m" or "30m" or "1h";
+    }
+
+    /// <summary>
+    /// 为前端生成可重放的表格数据：terms/date_histogram 分布 → table；数值聚合 → value；明细命中 → table。
+    /// 分布表首列桶值优先取 key_as_string（date_histogram 的 format 产物），数值列取桶内单值子聚合
+    /// （如 cardinality），没有时才显示文档数。terms 分布会带上聚合字段（aggField）与其 nested 路径，
+    /// 前端据此把桶值做成下钻入口。
     /// </summary>
     private static JsonObject? BuildTableData(JsonNode res, JsonObject body, IndexMeta meta)
     {
@@ -289,18 +378,36 @@ public class AiChatController : ControllerBase
             foreach (var (name, agg) in aggs)
             {
                 if (agg?["buckets"] is not JsonArray buckets || buckets.Count == 0) continue;
+                // 桶内单值子聚合（cardinality/avg/sum/min/max/value_count）作为数值列，列名取子聚合名；
+                // 没有时退回 doc_count。否则「每天独立 IP 数」这类问题表格只会显示文档数，与问题口径不符
+                var metrics = PickMetricNames(buckets[0]);
+                var dateFormat = DateHistogramFormat(body["aggs"] ?? body["aggregations"], name);
                 var rows = new JsonArray();
                 foreach (var b in buckets.Take(20))
                 {
+                    // date_histogram 指定 format 时 ES 额外返回 key_as_string（如 2026-10-01），
+                    // 而 key 恒为 epoch 毫秒；优先取格式化值，terms 桶无此字段再退回 key。
                     // 桶值保留原始 JSON 类型（数值字段的 key 是数字），下钻构造 term 时才能对上
-                    var key = b?["key"]?.DeepClone() ?? JsonValue.Create("");
-                    var docCount = b?["doc_count"]?.GetValue<long>() ?? 0;
-                    rows.Add(new JsonArray([key, docCount.ToString("N0")]));
+                    var key = (b?["key_as_string"] ?? b?["key"])?.DeepClone() ?? JsonValue.Create("");
+                    // 兜底：模型漏带 format 时 key 是 epoch 毫秒，补格式化为日期，避免表格出现时间戳
+                    if (dateFormat != null && key is JsonValue dv && dv.TryGetValue<long>(out var epochMs))
+                        key = JsonValue.Create(DateTimeOffset.FromUnixTimeMilliseconds(epochMs).ToString(dateFormat));
+                    var cells = new JsonArray([key]);
+                    if (metrics.Count > 0)
+                        foreach (var m in metrics) cells.Add(FormatMetricValue(b?[m]?["value"]));
+                    else
+                        cells.Add((b?["doc_count"]?.GetValue<long>() ?? 0).ToString("N0"));
+                    rows.Add(cells);
                 }
+                var columns = new JsonArray([name]);
+                if (metrics.Count > 0)
+                    foreach (var m in metrics) columns.Add(m);
+                else
+                    columns.Add("文档数");
                 var table = new JsonObject
                 {
                     ["kind"] = "table",
-                    ["columns"] = new JsonArray([name, "文档数"]),
+                    ["columns"] = columns,
                     ["rows"] = rows
                 };
                 var aggField = FindTermsField(body["aggs"] ?? body["aggregations"], name);

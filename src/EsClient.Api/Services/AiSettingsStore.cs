@@ -13,6 +13,11 @@ public class AiModelConfig
     public string Model { get; set; } = "";
     /// <summary>思考模式使用的模型名（可选，留空则与 Model 相同）。</summary>
     public string? ThinkingModel { get; set; }
+    /// <summary>
+    /// JSON 模式（response_format=json_object），只在「要求模型输出 JSON」的调用上生效：
+    /// null = 自动（端点报错时自动关闭并在进程内记住，推荐）、true = 强制开启、false = 关闭。
+    /// </summary>
+    public bool? JsonMode { get; set; }
 
     public bool IsValid => !string.IsNullOrWhiteSpace(BaseUrl) && !string.IsNullOrWhiteSpace(Model);
 }
@@ -106,6 +111,7 @@ public class AiSettingsStore
                 existing.ApiKey = c.ApiKey;
                 existing.Model = c.Model;
                 existing.ThinkingModel = c.ThinkingModel;
+                existing.JsonMode = c.JsonMode;
                 c = existing;
             }
             else

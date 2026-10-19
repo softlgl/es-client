@@ -24,7 +24,8 @@ public class AiController : ControllerBase
         _logger = logger;
     }
 
-    public record SaveSettingsRequest(string? Id, string Provider, string BaseUrl, string ApiKey, string Model, string? ThinkingModel);
+    public record SaveSettingsRequest(string? Id, string Provider, string BaseUrl, string ApiKey, string Model,
+        string? ThinkingModel, bool? JsonMode);
     public record ChatMsg(string Role, string Content);
     public record GenerateRequest(string Index, string Prompt, List<ChatMsg>? History, bool? Thinking,
         string? LastError, string? TimeZone);
@@ -83,7 +84,8 @@ public class AiController : ControllerBase
                 baseUrl = m.BaseUrl,
                 apiKey = m.ApiKey,
                 model = m.Model,
-                thinkingModel = m.ThinkingModel
+                thinkingModel = m.ThinkingModel,
+                jsonMode = m.JsonMode
             }),
             presets = AiSettingsStore.Presets.ToDictionary(
                 p => p.Key.ToLowerInvariant(), p => new
@@ -115,7 +117,8 @@ public class AiController : ControllerBase
             BaseUrl = req.BaseUrl.Trim().TrimEnd('/'),
             ApiKey = req.ApiKey?.Trim() ?? "",
             Model = req.Model.Trim(),
-            ThinkingModel = string.IsNullOrWhiteSpace(req.ThinkingModel) ? null : req.ThinkingModel.Trim()
+            ThinkingModel = string.IsNullOrWhiteSpace(req.ThinkingModel) ? null : req.ThinkingModel.Trim(),
+            JsonMode = req.JsonMode
         });
         return Ok(new { ok = true, id = saved.Id });
     }
@@ -191,7 +194,7 @@ public class AiController : ControllerBase
             messages.Add(new { role = "user", content = AiPrompts.GenerateUser(index, meta, samples, req.Prompt.Trim(), req.TimeZone) });
 
             var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
-                (type, text) => WriteSseAsync(type, new { text }, ct), ct);
+                (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true);
             var dsl = AiDslGuard.ExtractQueryDsl(content);
             if (dsl != null)
                 await WriteSseAsync("done", new { dsl }, ct);

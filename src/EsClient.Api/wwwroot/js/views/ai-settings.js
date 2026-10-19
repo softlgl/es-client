@@ -41,6 +41,15 @@ export function openAiSettingsDialog(onSaved) {
         <label>思考模式模型名（可选）</label>
         <input type="text" id="ai-tmodel" placeholder="开启思考模式时使用，留空则与模型名称相同">
       </div>
+      <div class="field">
+        <label>JSON 模式（response_format）</label>
+        <select id="ai-jsonmode">
+          <option value="">自动（推荐）</option>
+          <option value="on">强制开启</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div class="hint">JSON 模式让接口保证输出合法 JSON，减少解析失败；少数端点不支持时「自动」会自行降级。思考模式下不生效。</div>
       <div class="hint">密钥保存在本机 App_Data/ai-settings.json，不会上传；可保存多个配置，在顶栏随时切换</div>
       <div class="query-actions">
         <button class="btn btn-primary" id="ai-save" style="flex:1">保存</button>
@@ -54,6 +63,7 @@ export function openAiSettingsDialog(onSaved) {
     const key = root.querySelector('#ai-key');
     const model = root.querySelector('#ai-model');
     const tmodel = root.querySelector('#ai-tmodel');
+    const jsonmode = root.querySelector('#ai-jsonmode');
     const delBtn = root.querySelector('#ai-cfg-del');
 
     function fillForm(m) {
@@ -62,6 +72,7 @@ export function openAiSettingsDialog(onSaved) {
       key.value = m?.apiKey ?? '';
       model.value = m?.model ?? '';
       tmodel.value = m?.thinkingModel ?? '';
+      jsonmode.value = m?.jsonMode == null ? '' : (m.jsonMode ? 'on' : 'off');
       delBtn.disabled = !m;
     }
     fillForm(models.find(m => m.id === editingId));
@@ -102,7 +113,8 @@ export function openAiSettingsDialog(onSaved) {
           baseUrl: url.value.trim(),
           apiKey: key.value.trim(),
           model: model.value.trim(),
-          thinkingModel: tmodel.value.trim() || null
+          thinkingModel: tmodel.value.trim() || null,
+          jsonMode: jsonmode.value === '' ? null : (jsonmode.value === 'on')
         });
         // 新增的配置立即切换为使用中
         if (!editingId) await post('/api/ai/settings/switch', { id: r.id }).catch(() => {});
