@@ -69,7 +69,9 @@ export function openAiSettingsDialog(onSaved) {
     function fillForm(m) {
       provider.value = m?.provider ?? 'custom';
       url.value = m?.baseUrl ?? '';
-      key.value = m?.apiKey ?? '';
+      // 后端不回传明文密钥：置空，留空保存则保持原值不变
+      key.value = '';
+      key.placeholder = m?.hasApiKey ? '已保存，留空则不变' : 'sk-…';
       model.value = m?.model ?? '';
       tmodel.value = m?.thinkingModel ?? '';
       jsonmode.value = m?.jsonMode == null ? '' : (m.jsonMode ? 'on' : 'off');

@@ -66,10 +66,13 @@ public class IndicesController : ControllerBase
     }
 
     [HttpDelete("/api/indices/{name}")]
-    public async Task<IActionResult> Delete(string name, CancellationToken ct)
+    public async Task<IActionResult> Delete(string name, bool force, CancellationToken ct)
     {
         if (!IEsClient.IsValidIndexName(name))
             return BadRequest(new { error = $"非法索引名：{name}" });
+        // 系统/隐藏索引（以 . 开头，如 .kibana、.security）默认受保护，需显式 force 才删
+        if (!force && name.StartsWith('.'))
+            return BadRequest(new { error = $"索引 {name} 为系统索引（以 . 开头），已被保护；确需删除请使带确认的强制删除" });
         await _store.Require().DeleteIndexAsync(name, ct);
         _mapping.Invalidate(name); // 清除元数据缓存，避免重建同名索引后列定义过期
         return Ok(new { deleted = true });

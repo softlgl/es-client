@@ -76,7 +76,7 @@ public class ExportController : ControllerBase
         if (t == null) return NotFound(new { error = "任务不存在" });
         if (t.Status != "done")
             return BadRequest(new { error = $"任务尚未完成（{t.Status}）" });
-        var file = Path.Combine(Path.GetTempPath(), "es-client-exports", $"{t.Id}.xlsx");
+        var file = Path.Combine(ExportTaskStore.ExportDir, $"{t.Id}.xlsx");
         if (!System.IO.File.Exists(file))
             return NotFound(new { error = "导出文件已过期或已被删除" });
 

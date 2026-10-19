@@ -18,7 +18,7 @@ public class ConnectionEntry
 /// 多连接管理：以连接 URL 为 ID 保存多个集群连接，维护一个活动连接（本地单人工具）。
 /// 连接列表（含认证凭据）持久化到 App_Data/connections.json，重启后可重连。
 /// </summary>
-public class ConnectionStore
+public class ConnectionStore : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -159,6 +159,18 @@ public class ConnectionStore
         lock (_lock) return _map.Values.ToList();
     }
 
+    /// <summary>宿主关闭时释放全部活动客户端（Singleton 由 DI 自动调用 Dispose）。</summary>
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            foreach (var e in _map.Values)
+                e.Client?.Dispose();
+            _map.Clear();
+            _activeId = null;
+        }
+    }
+
     /// <summary>取当前客户端，未连接时抛 EsException。</summary>
     public EsHttpClient Require()
     {
@@ -166,6 +178,21 @@ public class ConnectionStore
         if (c == null)
             throw new EsException("尚未连接到 Elasticsearch，请先建立连接", 409);
         return c;
+    }
+
+    /// <summary>
+    /// 取当前活动连接的建连请求（含凭据）。导出等长任务据此新建独立连接执行，
+    /// 而非直接引用活动客户端 —— 否则主连接被断开/重连 Dispose 时会波及进行中的任务。
+    /// </summary>
+    public ConnectRequest RequireActiveRequest()
+    {
+        lock (_lock)
+        {
+            var e = _activeId != null && _map.TryGetValue(_activeId, out var entry) ? entry : null;
+            if (e?.Client == null)
+                throw new EsException("尚未连接到 Elasticsearch，请先建立连接", 409);
+            return e.Request;
+        }
     }
 
     // ---------- 持久化 ----------

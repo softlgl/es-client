@@ -169,6 +169,7 @@ public class AiChatController : ControllerBase
                     content = await _aiClient.StreamAsync(messages, req.Thinking == true,
                         (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true);
                     (body, parseError) = AiDslGuard.ExtractSearchBody(content);
+                    if (body == null) break; // 修正后仍解析不出可执行 DSL，交给下方收尾统一回告，避免解引用 null
                 }
 
                 await WriteSseAsync("dsl", new { dsl = body!.DeepClone() }, ct);
@@ -189,9 +190,9 @@ public class AiChatController : ControllerBase
             // 两次都没产出可执行 DSL / 仍执行失败：如实回告，不落库历史（避免污染上下文）
             if (body == null || execError != null)
             {
-                var msg = execError != null
-                    ? $"查询执行失败：{execError}"
-                    : $"AI 未能生成有效的查询：{parseError}";
+                var msg = body == null
+                    ? $"AI 未能生成有效的查询：{parseError}"
+                    : $"查询执行失败：{execError}";
                 await WriteSseAsync("error", new { error = msg }, ct);
                 return;
             }

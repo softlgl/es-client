@@ -37,6 +37,9 @@ public class ExportTaskStore
     public const long ExcelMaxRows = 1_048_575; // xlsx 单 sheet 数据行上限（减表头），本工具硬上限
     public const long DefaultMaxRows = 100_000;
 
+    /// <summary>导出临时目录：Service 写出与 Controller 下载共用同一路径，避免两处硬编码分叉。</summary>
+    public static string ExportDir => System.IO.Path.Combine(System.IO.Path.GetTempPath(), "es-client-exports");
+
     private readonly ConcurrentDictionary<string, ExportTaskInfo> _tasks = new();
     private readonly ConcurrentDictionary<string, ExportJob> _jobs = new();
     private readonly Channel<string> _queue;
@@ -106,14 +109,16 @@ public class ExportTaskStore
             Index = req.Index
         };
         _tasks[task.Id] = task;
+        // 捕获提交时的建连参数（而非活动客户端）：worker 据此新建独立连接执行，
+        // 生命周期与主连接解耦 —— 断开/重连主连接不会波及进行中的导出
         _jobs[task.Id] = new ExportJob(task.Id, req.Index, queryDsl, cols, req.IncludeId, maxRows,
-            _conn.Require()); // 捕获提交时的连接，切换连接不影响进行中的导出
+            _conn.RequireActiveRequest());
         _queue.Writer.TryWrite(task.Id);
         return task;
     }
 
     internal record ExportJob(string Id, string Index, JsonNode? QueryDsl,
-        List<ColumnMeta> Columns, bool IncludeId, long MaxRows, EsHttpClient Client);
+        List<ColumnMeta> Columns, bool IncludeId, long MaxRows, ConnectRequest Request);
 }
 
 /// <summary>导出后台服务：两个 worker 消费队列（并发 2），scroll 遍历 + MiniExcel 流式写出。</summary>
@@ -134,7 +139,7 @@ public class ExportTaskService : BackgroundService
         _logger = logger;
         _store = store;
         _conn = conn;
-        _exportDir = Path.Combine(Path.GetTempPath(), "es-client-exports");
+        _exportDir = ExportTaskStore.ExportDir;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -186,20 +191,40 @@ public class ExportTaskService : BackgroundService
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token, appStopping);
         var ct = cts.Token;
 
+        // 独立连接：用提交时保存的建连参数新建，导出结束即释放，
+        // 与主连接生命周期解耦（断开/重连主连接不影响进行中的导出）
+        EsHttpClient client;
+        try
+        {
+            client = await EsHttpClient.CreateAsync(job.Request, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            task.Status = "canceled";
+            return;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "导出任务 {TaskId} 建连失败", task.Id);
+            task.Status = "error";
+            task.Error = ex is EsException ? ex.Message : $"导出建连失败：{ex.Message}";
+            return;
+        }
+
         try
         {
             // 预检总数
             long? total;
             if (job.QueryDsl == null)
             {
-                var stats = await job.Client.GetStatsAsync(job.Index, ct);
+                var stats = await client.GetStatsAsync(job.Index, ct);
                 total = stats["_all"]?["primaries"]?["docs"]?["count"]?.GetValue<long>();
             }
             else
             {
                 try
                 {
-                    total = await job.Client.CountAsync(job.Index, job.QueryDsl, ct);
+                    total = await client.CountAsync(job.Index, job.QueryDsl, ct);
                 }
                 catch
                 {
@@ -210,7 +235,7 @@ public class ExportTaskService : BackgroundService
 
             // 生产者：scroll 拉取批次；消费者：MiniExcel 流式写出
             var batches = new BlockingCollection<Dictionary<string, object?>[]>(200);
-            var producer = ProduceScrollAsync(batches, job, total, task, ct);
+            var producer = ProduceScrollAsync(batches, client, job, total, task, ct);
             var rows = ConsumeRows(producer, batches, ct);
 
             await using (var stream = new FileStream(file, FileMode.Create, FileAccess.Write,
@@ -241,16 +266,19 @@ public class ExportTaskService : BackgroundService
             task.Error = ex is EsException ? ex.Message : $"导出失败：{ex.Message}";
             TryDelete(file);
         }
+        finally
+        {
+            client.Dispose();
+        }
     }
 
     /// <summary>scroll 生产者：批量拉取并转换为行字典，批次间检查取消。</summary>
     private async Task ProduceScrollAsync(BlockingCollection<Dictionary<string, object?>[]> batches,
-        ExportTaskStore.ExportJob job, long? total, ExportTaskInfo task, CancellationToken ct)
+        EsHttpClient client, ExportTaskStore.ExportJob job, long? total, ExportTaskInfo task, CancellationToken ct)
     {
         var scrollId = "";
         try
         {
-            var client = job.Client;
             var body = new JsonObject
             {
                 ["size"] = ScrollBatchSize,
@@ -289,7 +317,7 @@ public class ExportTaskService : BackgroundService
             // 任何退出路径都释放 scroll 上下文
             if (!string.IsNullOrEmpty(scrollId))
             {
-                try { await job.Client?.ClearScrollAsync(scrollId)!; }
+                try { await client.ClearScrollAsync(scrollId); }
                 catch { /* 尽力释放 */ }
             }
             batches.CompleteAdding();

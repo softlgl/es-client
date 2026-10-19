@@ -181,7 +181,7 @@ internal static class AiDslGuard
         if (obj.Any(kvp => kvp.Key is "sort" or "size" or "aggs" or "aggregations" or "_source"))
         {
             obj["query"] = new JsonObject { ["match_all"] = new JsonObject() };
-            return obj;
+            return (JsonObject)obj.DeepClone();
         }
 
         return null;

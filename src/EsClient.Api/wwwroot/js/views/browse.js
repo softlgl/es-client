@@ -14,6 +14,12 @@ const OPS = [
 const RANGE_OPS = new Set(['between', 'gt', 'gte', 'lt', 'lte']);
 const NO_VALUE_OPS = new Set(['exists', 'missing']);
 
+// 浏览器 IANA 时区：日期条件发到后端时用它，与 AI 生成路径口径一致
+// （否则后端 RangeClause 会退回服务器本地偏移，跨时区机器上结果会差一天）
+const BROWSER_TZ = (() => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { return ''; }
+})();
+
 // 每个索引的浏览状态（条件/翻页/列选择/排序），切换索引后切回可恢复
 const stateCache = new Map();
 // 每个索引最近一次实际执行的查询（buildQuery 的结果），供 AI 问答读取浏览上下文
@@ -222,7 +228,7 @@ export async function renderBrowse(view, index) {
       const conds = state.conditions.filter(c =>
         c.field && (NO_VALUE_OPS.has(c.op) || (c.value ?? '') !== ''));
       if (conds.length === 0) return null;
-      return { conditions: conds.map(c => ({ field: c.field, op: c.op, value: c.value || null, value2: c.value2 || null })), queryString: null };
+      return { conditions: conds.map(c => ({ field: c.field, op: c.op, value: c.value || null, value2: c.value2 || null })), queryString: null, timeZone: BROWSER_TZ || null };
     }
     if (state.qsMode === 'dsl') {
       const t = $('#dsl-input').value.trim();

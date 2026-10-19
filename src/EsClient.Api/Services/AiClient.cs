@@ -35,7 +35,7 @@ public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai)
         var http = httpFactory.CreateClient("ai");
         http.Timeout = Timeout.InfiniteTimeSpan; // 读流时长自行控制
 
-        var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        using var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         streamCts.CancelAfter(TimeSpan.FromMinutes(4));
 
         var model = thinking && !string.IsNullOrWhiteSpace(s.ThinkingModel) ? s.ThinkingModel : s.Model;

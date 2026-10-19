@@ -12,8 +12,10 @@ public class ConnectController : ControllerBase
     public ConnectController(ConnectionStore store) => _store = store;
 
     public record SwitchRequest(string Id);
-    public record UpdateRequest(string Id, string Name, string? Url, string? Username, string? Password, string? ApiKey, bool? Insecure);
+    public record UpdateRequest(string Id, string Name, string? Url, string? Username, string? Password, string? ApiKey, bool? Insecure, string? AuthMode);
 
+    // 列表/详情不回传明文凭据（apiKey/password），只给是否已配 + 认证方式；
+    // username 非机密保留以便展示。避免任何拿到该接口的页面/脚本直接读走密钥。
     private static object ConnItem(ConnectionEntry e) =>
         new
         {
@@ -23,7 +25,10 @@ public class ConnectController : ControllerBase
             clusterName = e.Info.ClusterName,
             version = e.Info.Version,
             username = e.Request.Username,
-            apiKey = e.Request.ApiKey,
+            hasApiKey = !string.IsNullOrEmpty(e.Request.ApiKey),
+            hasPassword = !string.IsNullOrEmpty(e.Request.Password),
+            authMode = !string.IsNullOrEmpty(e.Request.ApiKey) ? "apikey"
+                : !string.IsNullOrEmpty(e.Request.Username) ? "basic" : "none",
             insecure = e.Request.Insecure,
             connected = e.Connected
         };
@@ -66,7 +71,28 @@ public class ConnectController : ControllerBase
             return Ok(new { ok = true, connected = _store.IsConnected });
         }
 
-        var newReq = new ConnectRequest(req.Url, req.Username, req.Password, req.ApiKey, req.Insecure ?? false, req.Name);
+        // 凭据合并：前端不再回显明文，密钥框留空表示“保持不变”。
+        // 按 authMode 决定沿用/清除，空字段沿用原值（顺带修正旧行为：改基本认证时未重输密码会被清空）。
+        string? user = req.Username, pass = req.Password, key = req.ApiKey;
+        var old = entry.Request;
+        switch (req.AuthMode?.ToLowerInvariant())
+        {
+            case "none":
+                user = pass = key = null;
+                break;
+            case "basic":
+                if (string.IsNullOrEmpty(user)) user = old.Username;
+                if (string.IsNullOrEmpty(pass)) pass = old.Password;
+                key = null;
+                break;
+            case "apikey":
+                if (string.IsNullOrEmpty(key)) key = old.ApiKey;
+                user = pass = null;
+                break;
+            // authMode 缺省（旧客户端）：按传入值原样使用
+        }
+
+        var newReq = new ConnectRequest(req.Url, user, pass, key, req.Insecure ?? false, req.Name);
 
         if (!string.Equals(req.Url, req.Id, StringComparison.OrdinalIgnoreCase))
         {

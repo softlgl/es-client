@@ -24,7 +24,9 @@ export function confirmDeleteIndex(name, docsCount, onDeleted) {
   ok.addEventListener('click', async () => {
     ok.disabled = true;
     try {
-      await del(`/api/indices/${encodeURIComponent(name)}`);
+      // 系统索引（以 . 开头）已由弹窗的名称确认 + 红字警告担保，此处带 force 显式越过后端保护闸门
+      const qs = name.startsWith('.') ? '?force=true' : '';
+      await del(`/api/indices/${encodeURIComponent(name)}${qs}`);
       closeAllModals();
       toast(`索引 ${name} 已删除`);
       window.dispatchEvent(new Event('indices-changed'));

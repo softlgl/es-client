@@ -50,8 +50,11 @@ export function renderConnectForm(root, onSuccess, existing = null) {
     q('.f-name').value = existing.name || '';
     q('.f-url').value = existing.url || '';
     q('.f-insecure').checked = !!existing.insecure;
-    if (existing.apiKey) { auth.value = 'apikey'; q('.f-key').value = existing.apiKey; }
-    else if (existing.username != null) { auth.value = 'basic'; q('.f-user').value = existing.username; q('.f-pass').value = existing.password || ''; }
+    // 后端不再回传明文密钥/密码：按已保存的认证方式回填，凭据框留空表示保持不变
+    auth.value = existing.authMode || 'none';
+    if (auth.value === 'basic') q('.f-user').value = existing.username || '';
+    q('.f-pass').placeholder = existing.hasPassword ? '已保存，留空则不变' : '';
+    q('.f-key').placeholder = existing.hasApiKey ? '已保存，留空则不变' : 'API Key（支持原始 id:secret 或已编码值）';
     auth.dispatchEvent(new Event('change'));
     q('button[type="submit"]').textContent = '保存';
 
@@ -89,6 +92,7 @@ export function renderConnectForm(root, onSuccess, existing = null) {
       const body = {
         name: q('.f-name').value.trim(),
         url: q('.f-url').value.trim(),
+        authMode: auth.value,
         username: null,
         password: null,
         apiKey: null,

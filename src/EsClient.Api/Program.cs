@@ -1,5 +1,7 @@
 using EsClient.Api.Es;
 using EsClient.Api.Services;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -54,5 +56,32 @@ app.UseStaticFiles(new Microsoft.AspNetCore.Builder.StaticFileOptions
         OnPrepareResponse = ctx => ctx.Context.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate"
     });
 app.MapControllers();
+
+// 回环监听守卫：本工具的 Web API 不含鉴权，且集群凭据明文保存在 App_Data。
+// 只应绑定本机回环地址；若检测到非回环（0.0.0.0 / :: / 可路由 IP）监听则告警。
+// 不阻断启动（避免破坏既有部署），确需远程访问可用 ESCLIENT_ALLOW_REMOTE=1 确认知悉后降级。
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    var addrs = app.Services.GetRequiredService<IServer>()
+        .Features.Get<IServerAddressesFeature>()?.Addresses;
+    if (addrs is null) return;
+
+    static bool IsLoopback(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var u) &&
+        (u.IsLoopback || (u.Host.Length >= 4 && u.Host.StartsWith("127.")));
+
+    var remote = addrs.Where(a => !IsLoopback(a)).ToArray();
+    if (remote.Length == 0) return;
+
+    var ack = Environment.GetEnvironmentVariable("ESCLIENT_ALLOW_REMOTE") == "1";
+    var msg = "检测到非回环监听地址：" + string.Join(", ", remote) +
+        "。本工具的 API 无鉴权、凭据明文落盘，对外暴露会使任何能访问该端口者" +
+        "读取凭据并操作你的 Elasticsearch。" +
+        (ack ? "" : "（确需远程访问请自行评估风险，或设置环境变量 ESCLIENT_ALLOW_REMOTE=1 消除此警告）");
+
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
+    if (ack) logger.LogInformation("远程监听已确认：{Message}", msg);
+    else logger.LogWarning("{Message}", msg);
+});
 
 app.Run();

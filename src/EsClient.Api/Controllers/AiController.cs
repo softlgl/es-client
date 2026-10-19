@@ -68,8 +68,6 @@ public class AiController : ControllerBase
             .Where(m => m.Role is "user" or "assistant" && !string.IsNullOrWhiteSpace(m.Content));
     }
 
-    
-
     [HttpGet("/api/ai/settings")]
     public IActionResult Settings()
     {
@@ -82,7 +80,8 @@ public class AiController : ControllerBase
                 id = m.Id,
                 provider = m.Provider,
                 baseUrl = m.BaseUrl,
-                apiKey = m.ApiKey,
+                apiKey = MaskKey(m.ApiKey),
+                hasApiKey = !string.IsNullOrWhiteSpace(m.ApiKey),
                 model = m.Model,
                 thinkingModel = m.ThinkingModel,
                 jsonMode = m.JsonMode
@@ -110,12 +109,20 @@ public class AiController : ControllerBase
         var provider = string.IsNullOrWhiteSpace(req.Provider) ? "custom" : req.Provider.Trim().ToLowerInvariant();
         if (!AiSettingsStore.Presets.ContainsKey(provider)) provider = "custom";
 
+        // 编辑已有配置时，密钥留空 = 保持不变（前端不再回显明文，避免把密钥拉回浏览器）
+        var apiKey = req.ApiKey?.Trim();
+        if (string.IsNullOrEmpty(apiKey) && !string.IsNullOrWhiteSpace(req.Id))
+        {
+            var prev = _ai.List().FirstOrDefault(m => m.Id == req.Id!.Trim());
+            if (prev != null) apiKey = prev.ApiKey;
+        }
+
         var saved = _ai.Save(new AiModelConfig
         {
             Id = string.IsNullOrWhiteSpace(req.Id) ? Guid.NewGuid().ToString("N") : req.Id!.Trim(),
             Provider = provider,
             BaseUrl = req.BaseUrl.Trim().TrimEnd('/'),
-            ApiKey = req.ApiKey?.Trim() ?? "",
+            ApiKey = apiKey ?? "",
             Model = req.Model.Trim(),
             ThinkingModel = string.IsNullOrWhiteSpace(req.ThinkingModel) ? null : req.ThinkingModel.Trim(),
             JsonMode = req.JsonMode
@@ -210,12 +217,12 @@ public class AiController : ControllerBase
         }
     }
 
-    /// <summary>安全读取 JsonNode 字符串（缺失 / JSON null / 非字符串均返回 null）。</summary>
-    private static string? NodeStr(JsonNode? node) => AiClient.NodeStr(node);
+    /// <summary>将密钥脱敏为只保留后 4 位的预览，用于不回传明文的列表展示。</summary>
+    private static string? MaskKey(string? key) =>
+        string.IsNullOrEmpty(key) ? null
+        : key.Length <= 4 ? new string('•', key.Length)
+        : "••••" + key[^4..];
 
     private Task WriteSseAsync(string type, object payload, CancellationToken ct) =>
         SseStream.WriteAsync(Response, type, payload, ct);
-
-    
-
-    }
+}

@@ -7,7 +7,7 @@ namespace EsClient.Api.Services;
 public record Condition(string Field, string Op, string? Value, string? Value2);
 
 /// <summary>检索条件（简单条件 + 自由查询字符串 + 原生 DSL 三选一或组合）。</summary>
-public record QuerySpec(List<Condition>? Conditions, string? QueryString, JsonNode? Dsl = null)
+public record QuerySpec(List<Condition>? Conditions, string? QueryString, JsonNode? Dsl = null, string? TimeZone = null)
 {
     public bool IsEmpty =>
         (Conditions == null || Conditions.Count == 0) &&
@@ -44,7 +44,7 @@ public class QueryBuilder
                 if (string.IsNullOrWhiteSpace(c.Field)) continue;
                 if (!columns.TryGetValue(c.Field, out var col))
                     throw new EsException($"未知字段：{c.Field}", 400);
-                var clause = BuildCondition(c, col);
+                var clause = BuildCondition(c, col, spec.TimeZone);
                 if (clause != null) must.Add(clause);
             }
         }
@@ -67,7 +67,7 @@ public class QueryBuilder
         return new JsonObject { ["bool"] = new JsonObject { ["must"] = new JsonArray([.. must]) } };
     }
 
-    private JsonNode? BuildCondition(Condition c, ColumnMeta col)
+    private JsonNode? BuildCondition(Condition c, ColumnMeta col, string? timeZone)
     {
         var v = c.Value ?? "";
         switch (c.Op)
@@ -92,13 +92,13 @@ public class QueryBuilder
             case "prefix":
                 return PrefixClause(col, v);
             case "gt": case "gte": case "lt": case "lte":
-                return RangeClause(col, c.Op, v, null);
+                return RangeClause(col, c.Op, v, null, timeZone);
             case "between":
                 if (string.IsNullOrEmpty(c.Value2))
                     throw new EsException($"字段 {c.Field} 的范围条件需要两个值", 400);
                 // 必须传 "between"：传 "gte" 会命中 RangeClause 的 gte 分支，
                 // 「止」被静默丢弃，区间退化成只有下限 —— 命中数偏多，且用户无从察觉
-                return RangeClause(col, "between", v, c.Value2);
+                return RangeClause(col, "between", v, c.Value2, timeZone);
             default:
                 throw new EsException($"不支持的操作符：{c.Op}", 400);
         }
@@ -172,7 +172,7 @@ public class QueryBuilder
         return new JsonObject { ["prefix"] = new JsonObject { [field] = p } };
     }
 
-    private static JsonObject RangeClause(ColumnMeta col, string op, string v1, string? v2)
+    private static JsonObject RangeClause(ColumnMeta col, string op, string v1, string? v2, string? timeZone)
     {
         var range = new JsonObject();
         switch (op)
@@ -186,12 +186,19 @@ public class QueryBuilder
                 if (v2 != null) range["lte"] = v2;
                 break;
         }
-        // date 字段：用户输入为本地时间，显式指定时区避免被当 UTC
+        // date 字段：用户输入为本地时间，显式指定时区避免被当 UTC。
+        // 前端传入浏览器 IANA 时区时优先用它（与手动/AI 两条路径口径一致）；
+        // 缺省再回落服务器本地偏移（旧行为）。
         if (col.Type == "date" || col.Type == "date_nanos")
         {
-            var offset = TimeZoneInfo.Local.GetUtcOffset(DateTime.Now);
-            range["time_zone"] = (offset >= TimeSpan.Zero ? "+" : "-") +
-                                 offset.Duration().ToString(@"hh\:mm");
+            if (!string.IsNullOrWhiteSpace(timeZone))
+                range["time_zone"] = timeZone.Trim();
+            else
+            {
+                var offset = TimeZoneInfo.Local.GetUtcOffset(DateTime.Now);
+                range["time_zone"] = (offset >= TimeSpan.Zero ? "+" : "-") +
+                                     offset.Duration().ToString(@"hh\:mm");
+            }
         }
         return new JsonObject { ["range"] = new JsonObject { [col.Path] = range } };
     }
