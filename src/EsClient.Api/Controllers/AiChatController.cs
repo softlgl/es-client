@@ -418,6 +418,10 @@ public class AiChatController : ControllerBase
                     // nested 路径下的字段必须用 nested 查询包裹，否则 term 匹配不到嵌套文档
                     var nested = meta.ResolveNestedPath(aggField);
                     if (nested != null) table["aggNested"] = nested;
+                    // 桶值下钻需带上产生该聚合的原始 query（否则下钻会丢掉筛选条件）。
+                    // 写在 data 上而非仅依赖最终渲染的 DSL 折叠区，流式总结期间抢点也能取到。
+                    // 无 query（纯 aggs 的 match_all）则不写，前端自行回退。
+                    if (body["query"] != null) table["baseQuery"] = body["query"]!.DeepClone();
                 }
                 return table;
             }

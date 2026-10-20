@@ -195,7 +195,11 @@ export async function renderAiChat(view, index) {
     const caption = data.kind === 'table' && data.total != null
       ? `<div class="chat-table-cap">命中 ${fmtNum(data.total)} 条${data.truncated ? `，此处仅展示前 ${data.rows.length} 条` : ''}</div>`
       : '';
-    return `${caption}<table class="chat-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+    // baseQuery：后端在建聚合表时写入的原始 query（产生该分布的筛选条件）。挂到表格上，
+    // 下钻时优先取它——比从 DSL 折叠区读更早可用（流式总结期间表格已渲染、DSL 尚未 finalize）。
+    const bq = drillable && data.baseQuery != null
+      ? ` data-base-query="${escapeHtml(JSON.stringify(data.baseQuery))}"` : '';
+    return `${caption}<table class="chat-table"${bq}><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   // 判据是「浏览页能否执行」——buildQuery 要求 DSL 必须含 query 子句，纯 aggs 的请求会被拒绝。
@@ -235,6 +239,26 @@ export async function renderAiChat(view, index) {
     </div>`;
   }
 
+  // 取桶值下钻需带上的原始 query：优先读表格 data-base-query（后端在建表时写入，流式期间即
+  // 可用），回退到该条回答的 DSL 折叠区（每轮 assistant 都持久化了 dsl）。都取不到返回 null
+  // → 调用方回退旧行为，不至于更差。
+  function readDrillBaseQuery(el) {
+    const tbl = el.closest('.chat-table');
+    const raw = tbl?.dataset.baseQuery;
+    if (raw) {
+      try {
+        const q = JSON.parse(raw);
+        if (q != null) return q;
+      } catch { /* 损坏则回退 DSL */ }
+    }
+    const pre = el.closest('.chat-msg')?.querySelector('.chat-dsl pre');
+    if (!pre) return null;
+    try {
+      const obj = JSON.parse(pre.dataset.raw || pre.textContent);
+      return obj && obj.query != null ? obj.query : null;
+    } catch { return null; }
+  }
+
   // 事件委托：历史与新增回答共用
   msgs.addEventListener('click', e => {
     // 聚合桶值下钻：按该桶值加 term 条件进数据浏览。浏览页不执行 aggs，只能这样下钻
@@ -244,7 +268,14 @@ export async function renderAiChat(view, index) {
       try { val = JSON.parse(drill.dataset.v); } catch { return; }
       const field = drill.dataset.field;
       const leaf = new TermQueryBuilder(field, val, drill.dataset.nested);
-      sessionStorage.setItem('ai-open-in-browse', JSON.stringify({ query: leaf.build(), size: 50 }, null, 2));
+      // 桶值下钻必须带上产生该聚合的原始 query（userCode/时间区间等），
+      // 否则明细变成「全库匹配该值」，与聚合桶数对不上。base 从该条回答的 DSL 里取。
+      // 原 query 整体作为一个 must 元素嵌入（无论它是否已是 bool），恒等于「原条件 AND 桶值」。
+      const baseQuery = readDrillBaseQuery(drill);
+      const query = baseQuery
+        ? { bool: { must: [baseQuery, leaf.build()] } }
+        : leaf.build();   // 取不到 base（如流式未 finalize / DSL 无 query）→ 回退旧行为，不至于更差
+      sessionStorage.setItem('ai-open-in-browse', JSON.stringify({ query, size: 50 }, null, 2));
       location.hash = `#/browse/${encodeURIComponent(index)}`;
       return;
     }
