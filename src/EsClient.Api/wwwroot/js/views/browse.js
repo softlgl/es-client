@@ -6,7 +6,8 @@ import { openDocDetail, openNewDocDialog } from './doc-dialog.js?v=14';
 
 const OPS = [
   { v: 'eq', label: '等于' }, { v: 'ne', label: '不等于' },
-  { v: 'contains', label: '包含', warn: '“包含”用通配符实现，大索引上可能较慢' }, { v: 'prefix', label: '前缀' },
+  { v: 'contains', label: '包含', warn: '“包含”：text 字段走 match_phrase 分词词组匹配（非严格子串，词内切片会漏）；keyword/ip 走通配符（大索引上可能较慢）；数值/日期退化为精确匹配' },
+  { v: 'prefix', label: '前缀', warn: '“前缀”：text 走 match_phrase_prefix 词组前缀匹配；keyword/ip 走通配前缀；数值/日期无前缀语义，退化为精确匹配' },
   { v: 'between', label: '介于' }, { v: 'gt', label: '大于' }, { v: 'gte', label: '≥' },
   { v: 'lt', label: '小于' }, { v: 'lte', label: '≤' },
   { v: 'exists', label: '存在' }, { v: 'missing', label: '不存在' }

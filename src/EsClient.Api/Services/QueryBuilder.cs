@@ -110,8 +110,10 @@ public class QueryBuilder
         JsonNode leaf;
         if (col.Type == "text")
         {
+            // text 带 keyword 子字段 → term 精确匹配（需整段值相等）。
+            // 曾因漏写外层 "term" 包裹而生成 {"a.keyword":"v"} 这种非法子句，导致 ES 报 parsing_exception。
             leaf = col.KeywordPath != null
-                ? new JsonObject { [col.KeywordPath] = value }
+                ? new JsonObject { ["term"] = new JsonObject { [col.KeywordPath] = value } }
                 : new JsonObject { ["match"] = new JsonObject { [col.Path] = value } };
         }
         else
@@ -124,15 +126,15 @@ public class QueryBuilder
 
     private JsonNode ContainsClause(ColumnMeta col, string value)
     {
-        string field;
+        // text：用 match_phrase 走分析后的主字段。
+        // 曾用 wildcard on .keyword，但 keyword 子字段常带 ignore_above(默认 256)，
+        // 超长值根本不进索引 → 长文本「包含」会静默漏查（日志类 message 尤其明显）。
+        // 代价：语义从「真子串」变为「分词后连续词组」，词内切片（如 refus 匹配 error）不再命中。
         if (col.Type == "text")
-        {
-            if (col.KeywordPath != null)
-                field = col.KeywordPath; // wildcard on keyword
-            else
-                return new JsonObject { ["match"] = new JsonObject { [col.Path] = value } };
-        }
-        else if (col.Type == "keyword" || col.Type == "ip" || col.Type == "version")
+            return new JsonObject { ["match_phrase"] = new JsonObject { [col.Path] = value } };
+
+        string field;
+        if (col.Type == "keyword" || col.Type == "ip" || col.Type == "version")
         {
             field = col.Path;
         }
@@ -150,25 +152,26 @@ public class QueryBuilder
 
     private JsonNode PrefixClause(ColumnMeta col, string value)
     {
-        string field;
+        // text：用 match_phrase_prefix 走分析后的主字段。
+        // 曾用 prefix on .keyword，与「包含」同源——keyword 子字段 ignore_above 会截断长值而漏查。
         if (col.Type == "text")
-        {
-            if (col.KeywordPath != null)
-                field = col.KeywordPath;
-            else
-                return new JsonObject { ["match_phrase_prefix"] = new JsonObject { [col.Path] = value } };
-        }
-        else
+            return new JsonObject { ["match_phrase_prefix"] = new JsonObject { [col.Path] = value } };
+
+        string field;
+        if (col.Type == "keyword" || col.Type == "ip" || col.Type == "version")
         {
             field = col.Path;
         }
+        else
+        {
+            // 数值/日期等类型没有「前缀」语义：prefix 打在 points 索引（无 terms）会静默返回空，
+            // 与 ContainsClause 对称，退化为 term 精确匹配。
+            return TermClause(col, value, negate: false);
+        }
 
         var p = new JsonObject { ["value"] = value };
-        if (field == col.KeywordPath || col.Type == "keyword")
-        {
-            if (_conn.Active?.Info.SupportsCaseInsensitiveWildcard == true)
-                p["case_insensitive"] = true;
-        }
+        if (_conn.Active?.Info.SupportsCaseInsensitiveWildcard == true)
+            p["case_insensitive"] = true;
         return new JsonObject { ["prefix"] = new JsonObject { [field] = p } };
     }
 
