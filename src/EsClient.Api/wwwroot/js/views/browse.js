@@ -6,7 +6,7 @@ import { openDocDetail, openNewDocDialog } from './doc-dialog.js?v=14';
 
 const OPS = [
   { v: 'eq', label: '等于' }, { v: 'ne', label: '不等于' },
-  { v: 'contains', label: '包含', warn: true }, { v: 'prefix', label: '前缀' },
+  { v: 'contains', label: '包含', warn: '“包含”用通配符实现，大索引上可能较慢' }, { v: 'prefix', label: '前缀' },
   { v: 'between', label: '介于' }, { v: 'gt', label: '大于' }, { v: 'gte', label: '≥' },
   { v: 'lt', label: '小于' }, { v: 'lte', label: '≤' },
   { v: 'exists', label: '存在' }, { v: 'missing', label: '不存在' }
@@ -293,14 +293,17 @@ export async function renderBrowse(view, index) {
 
   function updateHint() {
     const h = $('#query-hint');
-    const warn = state.conditions.some(c => c.op === 'contains');
+    // 警告文案由 OPS 元数据驱动：算子只要在定义里挂了 warn，被选中时自动显示，
+    // 无需再在此处硬编码算子名（去重，多个条件命中同一算子只显示一次）
+    const warns = [...new Set(state.conditions
+      .map(c => OPS.find(o => o.v === c.op)?.warn).filter(Boolean))];
     // DSL 模式下每页条数最终来自 DSL 的 size（改工具条会同步改写它），
     // 显式说明来源，否则用户在工具条与 DSL 两处看到的数字不同时会不知该改哪儿。
     const dslSizeNote = state.tab === 'query' && state.qsMode === 'dsl'
       && state.lastQuerySize && state.lastQuerySize !== state.pageSize
       ? `<div>本次每页 ${fmtNum(state.lastQuerySize)} 条由 DSL 中的 size 决定；调整工具条的每页条数会同步改写 DSL</div>`
       : '';
-    h.innerHTML = (warn ? '<div class="hint-warn">“包含”用通配符实现，大索引上可能较慢</div>' : '') +
+    h.innerHTML = warns.map(w => `<div class="hint-warn">${w}</div>`).join('') +
       (state.sampled ? '<div>该索引无 mapping，列由文档采样生成</div>' : '') +
       dslSizeNote +
       `<div>共 ${meta.columns.length} 个字段 · max_result_window ${fmtNum(meta.maxResultWindow)}</div>`;
