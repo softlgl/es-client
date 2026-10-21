@@ -14,6 +14,9 @@ public record ConnectRequest(string Url, string? Username, string? Password, str
 /// </summary>
 public class EsHttpClient : IEsClient
 {
+    /// <summary>单个请求的超时秒数；建连时用于 HttpClient.Timeout，也用于超时错误文案。</summary>
+    private const int TimeoutSec = 30;
+
     private readonly HttpClient _http;
 
     public ConnectionInfo Info { get; }
@@ -40,7 +43,7 @@ public class EsHttpClient : IEsClient
             handler.ServerCertificateCustomValidationCallback =
                 HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
 
-        var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+        var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(TimeoutSec) };
         http.BaseAddress = new Uri(url + "/");
         http.DefaultRequestHeaders.Accept.ParseAdd("application/json");
 
@@ -98,7 +101,7 @@ public class EsHttpClient : IEsClient
         if (jsonBody != null)
             req.Content = new StringContent(jsonBody,
                 Encoding.UTF8, contentType ?? "application/json");
-        using var res = await _http.SendAsync(req, ct);
+        using var res = await SendRawAsync(req, ct);
         var text = await res.Content.ReadAsStringAsync(ct);
 
         if (!res.IsSuccessStatusCode)
@@ -135,6 +138,23 @@ public class EsHttpClient : IEsClient
         if (text.Length == 0)
             throw new EsException($"ES 返回空响应（{method} {path}）");
         return JsonNode.Parse(text) ?? throw new EsException($"ES 返回空响应（{method} {path}）");
+    }
+
+    /// <summary>发送原始请求。把 HttpClient 的 30s 超时翻译成友好的中文
+    /// EsException；调用方主动取消（ct 已触发）则原样抛出，不当作超时。</summary>
+    private async Task<HttpResponseMessage> SendRawAsync(HttpRequestMessage req, CancellationToken ct)
+    {
+        try
+        {
+            return await _http.SendAsync(req, ct);
+        }
+        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // HttpClient 超时抛 TaskCanceledException（内层 TimeoutException），
+            // 排除调用方主动取消后才判定为超时，避免底层英文文案直接甩给中文界面。
+            throw new EsException(
+                $"请求超时（超过 {TimeoutSec} 秒），请用更精确的条件缩小范围或稍后重试", 504, "timeout");
+        }
     }
 
     private static string Serialize(JsonNode? node) => node?.ToJsonString() ?? "";
