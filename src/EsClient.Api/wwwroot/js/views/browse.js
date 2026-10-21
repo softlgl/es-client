@@ -294,10 +294,22 @@ export async function renderBrowse(view, index) {
 
   function updateHint() {
     const h = $('#query-hint');
-    // 警告文案由 OPS 元数据驱动：算子只要在定义里挂了 warn，被选中时自动显示，
-    // 无需再在此处硬编码算子名（去重，多个条件命中同一算子只显示一次）
-    const warns = [...new Set(state.conditions
-      .map(c => OPS.find(o => o.v === c.op)?.warn).filter(Boolean))];
+    // 字段路径 → 类型，用于按类型给预警（eq/ne 是默认算子、text 又常见，
+    // 不加类型门槛会天天弹，这里只在真正受 ignore_above 影响时才提示）
+    const typeOf = p => meta.columns.find(c => c.path === p)?.type;
+    const ws = [];
+    for (const c of state.conditions) {
+      // 算子级预警由 OPS 元数据驱动（包含/前缀），挂了 warn 就显示
+      const op = OPS.find(o => o.v === c.op);
+      if (op?.warn) ws.push(op.warn);
+      // 3b：eq/ne 打在 text 字段是整段精确匹配，超长值受 keyword ignore_above 影响
+      if ((c.op === 'eq' || c.op === 'ne') && typeOf(c.field) === 'text')
+        ws.push('“等于/不等于”对 text 字段按整段精确匹配，超长值（keyword ignore_above）可能漏查；“不等于”还会漏排除这些长文本');
+    }
+    // 4：text 排序走 keyword 子字段，超长值被当空值排
+    if (state.sort && typeOf(state.sort.field) === 'text')
+      ws.push('按 text 字段排序走的是 keyword 子字段，超长值（ignore_above）会被当作空值排序');
+    const warns = [...new Set(ws)];
     // DSL 模式下每页条数最终来自 DSL 的 size（改工具条会同步改写它），
     // 显式说明来源，否则用户在工具条与 DSL 两处看到的数字不同时会不知该改哪儿。
     const dslSizeNote = state.tab === 'query' && state.qsMode === 'dsl'
