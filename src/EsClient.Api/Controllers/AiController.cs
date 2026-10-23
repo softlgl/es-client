@@ -2,6 +2,7 @@ using System.Text.Json.Nodes;
 using EsClient.Api.Es;
 using EsClient.Api.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.AI;
 
 namespace EsClient.Api.Controllers;
 
@@ -56,17 +57,13 @@ public class AiController : ControllerBase
     // ---------- 解析与安全约束 ----------
 
     /// <summary>
-    /// 取历史末尾 maxTurns 个完整轮次（以 assistant 为轮次边界向前成对取）。
+    /// 取历史末尾 maxTurns 个完整轮次（以 assistant 为轮次边界向前成对取，算法见 HistoryWindow）。
     /// 按条数截断会把「用户需求 / 模型输出」切成半轮，多轮修正的指代就失去了上下文。
+    /// 成对截断后再滤掉非 user/assistant 或空内容的条目。
     /// </summary>
-    private static IEnumerable<ChatMsg> TakeLastTurns(List<ChatMsg> history, int maxTurns)
-    {
-        var end = history.FindLastIndex(m => m.Role == "assistant") + 1;
-        if (end == 0) end = history.Count; // 无 assistant 记录则退化为按条数取
-        var start = Math.Max(0, end - maxTurns * 2);
-        return history.Skip(start).Take(end - start)
+    private static IEnumerable<ChatMsg> TakeLastTurns(List<ChatMsg> history, int maxTurns) =>
+        HistoryWindow.Take(history, maxTurns, m => m.Role)
             .Where(m => m.Role is "user" or "assistant" && !string.IsNullOrWhiteSpace(m.Content));
-    }
 
     [HttpGet("/api/ai/settings")]
     public IActionResult Settings()
@@ -188,27 +185,29 @@ public class AiController : ControllerBase
             samplingCts.CancelAfter(TimeSpan.FromSeconds(5)); // 采样失败不阻塞生成
             var samples = await _aiClient.SampleFieldValuesAsync(client, index, meta, samplingCts.Token);
 
-            var messages = new List<object>
+            var messages = new List<ChatMessage>
             {
-                new { role = "system", content = AiPrompts.GenerateSystem() }
+                new(ChatRole.System, AiPrompts.GenerateSystem())
             };
             // 多轮修正：按完整轮次（user→assistant）成对截断，避免只剩半轮使指代失效
             foreach (var m in TakeLastTurns(req.History ?? [], 4))
-                messages.Add(new { role = m.Role, content = m.Content });
+                messages.Add(new ChatMessage(new ChatRole(m.Role), m.Content));
             // 错误自愈：把上一次的失败原因回传给模型，让它自行修正
             if (!string.IsNullOrWhiteSpace(req.LastError))
-                messages.Add(new { role = "user", content = $"上一次生成失败，错误信息：{req.LastError}。请修正后重新输出，仍须遵守全部规则。" });
-            messages.Add(new { role = "user", content = AiPrompts.GenerateUser(index, meta, samples, req.Prompt.Trim(), req.TimeZone) });
+                messages.Add(new ChatMessage(ChatRole.User,
+                    $"上一次生成失败，错误信息：{req.LastError}。请修正后重新输出，仍须遵守全部规则。"));
+            messages.Add(new ChatMessage(ChatRole.User,
+                AiPrompts.GenerateUser(index, meta, samples, req.Prompt.Trim(), req.TimeZone)));
 
             var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
                 (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true);
             var dsl = AiDslGuard.ExtractQueryDsl(content);
             if (dsl != null)
-                await WriteSseAsync("done", new { dsl }, ct);
+                await WriteSseAsync(SseEvent.Done, new { dsl }, ct);
             else
             {
                 _logger.LogWarning("AI 返回内容无法解析为 JSON：{Content}", content.Length > 300 ? content[..300] : content);
-                await WriteSseAsync("error", new { error = "AI 返回的内容不是有效 JSON，请重试或调整描述" }, ct);
+                await WriteSseAsync(SseEvent.Error, new { error = "AI 返回的内容不是有效 JSON，请重试或调整描述" }, ct);
             }
         }
         catch (Exception ex)

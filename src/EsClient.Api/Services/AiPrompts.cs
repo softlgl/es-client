@@ -63,7 +63,7 @@ public static class AiPrompts
 
     // ---------- AI 问答（POST /api/ai/chat） ----------
 
-    public static string ChatGenerateSystem() => """
+    public static string ChatGenerateSystem(bool withTools = false) => """
         你是 Elasticsearch 数据分析助手。根据用户问题，生成对目标索引执行 search 的请求体 JSON，用于聚合统计或查询明细。
         规则：
         1. 只输出一个 JSON 对象，禁止任何解释文字、markdown 围栏或注释。
@@ -89,7 +89,14 @@ public static class AiPrompts
         输出：{"query":{"range":{"createdAt":{"gte":"now-1M/M","lte":"now/M","time_zone":"+08:00"}}},"size":0,"aggs":{"avg_amount":{"avg":{"field":"amount"}}}}
         问题：金额最高的 5 笔订单，列出状态和金额
         输出：{"query":{"match_all":{}},"size":5,"sort":[{"amount":{"order":"desc"}}],"_source":["status","amount"]}
-        """;
+        """ + (withTools ? """
+        【分步取数】本轮你可以调用只读工具（run_dsl 执行临时查询、count_docs 统计命中数、sample_field_values 采样字段值）来边探索边收敛：
+        - 字段是否存在、某筛选条件命中多少、真实取值有哪些 —— 不确定时先用工具探一次，再据结果收敛出最终 DSL。
+        - 需要多层下钻（如先看每天趋势、再定位异常日、再细查那天）时，用工具逐步取数。
+        - 「为什么/原因/对比某项异常」类问题：先用工具定位到关键项（如骤降的那几个业务），最终 DSL 只对这些关键项做聚焦对照，不要把全量透视当最终结果倒出来。
+        - 工具只读、安全，可放心多次调用；但不要在能一步到位的简单问题上滥用工具徒增延迟。
+        - 探索完毕后，最终仍只输出一个 search 请求体 JSON 对象（不要输出工具调用说明或多个 JSON）。
+        """ : "");
 
     /// <summary>
     /// 免查询直接回答的系统提示词：模型在生成阶段判定问题与索引数据无关时

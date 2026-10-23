@@ -1,7 +1,7 @@
-import { get, post, del, toast, fmtNum } from '../api.js?v=14';
-import { escapeHtml, highlightJson } from '../ui.js?v=14';
-import { streamSse } from '../sse.js?v=14';
-import { getBrowseQueryContext } from './browse.js?v=14';
+import { get, post, del, toast, fmtNum } from '../api.js';
+import { escapeHtml, highlightJson } from '../ui.js';
+import { streamSse } from '../sse.js';
+import { getBrowseQueryContext } from './browse.js';
 
 // 桶值下钻用的 term 查询构造：字段位于 nested 路径下时必须用 nested 包裹，
 // 否则 ES 匹配不到嵌套文档里的值
@@ -67,6 +67,9 @@ export async function renderAiChat(view, index) {
         <label class="chat-ctrl" title="开启后使用思考模型生成查询">
           <input type="checkbox" id="chat-thinking"> 思考模式
         </label>
+        <label class="chat-ctrl" title="开启后 AI 可分步调用只读工具（临时查询/计数/采样）探索数据再收敛，适合复杂多层下钻问题">
+          <input type="checkbox" id="chat-tools"> 工具探索
+        </label>
       </div>
       <div class="chat-msgs" id="chat-msgs"></div>
       <div class="chat-input-row">
@@ -85,10 +88,14 @@ export async function renderAiChat(view, index) {
   const input = view.querySelector('#chat-input');
   const sendBtn = view.querySelector('#chat-send');
   const thinkCb = view.querySelector('#chat-thinking');
+  const toolsCb = view.querySelector('#chat-tools');
 
   thinkCb.checked = localStorage.getItem('ai-thinking') !== '0';
   thinkCb.addEventListener('change', () =>
     localStorage.setItem('ai-thinking', thinkCb.checked ? '1' : '0'));
+  toolsCb.checked = localStorage.getItem('ai-tools') === '1';
+  toolsCb.addEventListener('change', () =>
+    localStorage.setItem('ai-tools', toolsCb.checked ? '1' : '0'));
 
   view.querySelector('#vs-browse').addEventListener('click', () => {
     location.hash = `#/browse/${encodeURIComponent(index)}`;
@@ -192,9 +199,11 @@ export async function renderAiChat(view, index) {
     }).join('')}</tr>`).join('');
     // 命中总数 + 节选提示：问答表格只展示前若干行，没有这个基准就无法与
     // 数据浏览的结果核对（那边按同一份 DSL 执行，展示的是完整字段）
-    const caption = data.kind === 'table' && data.total != null
-      ? `<div class="chat-table-cap">命中 ${fmtNum(data.total)} 条${data.truncated ? `，此处仅展示前 ${data.rows.length} 条` : ''}</div>`
-      : '';
+    const caption = data.note
+      ? `<div class="chat-table-cap">${escapeHtml(data.note)}</div>`
+      : data.kind === 'table' && data.total != null
+        ? `<div class="chat-table-cap">命中 ${fmtNum(data.total)} 条${data.truncated ? `，此处仅展示前 ${data.rows.length} 条` : ''}</div>`
+        : '';
     // baseQuery：后端在建聚合表时写入的原始 query（产生该分布的筛选条件）。挂到表格上，
     // 下钻时优先取它——比从 DSL 折叠区读更早可用（流式总结期间表格已渲染、DSL 尚未 finalize）。
     const bq = drillable && data.baseQuery != null
@@ -394,11 +403,14 @@ export async function renderAiChat(view, index) {
     try {
       // onEvent 返回 false 表示已收尾（收到 done/error）
       const settled = await streamSse(`/api/ai/chat/${encodeURIComponent(index)}`, {
-        sessionId, question, thinking: thinkCb.checked, timeZone,
+        sessionId, question, thinking: thinkCb.checked, tools: toolsCb.checked, timeZone,
         currentQuery: browseContext
       }, abortCtl.signal, async ev => {
         if (ev.type === 'status') {
-          statusEl.innerHTML = `<span class="spinner"></span>${escapeHtml(ev.text || '')}`;
+          const t = escapeHtml(ev.text || '');
+          statusEl.innerHTML = t.startsWith('🔧')
+            ? `<span class="spinner"></span><code>${t}</code>`
+            : `<span class="spinner"></span>${t}`;
         } else if (ev.type === 'reasoning') {
           if (!reasoningShown) { reasonEl.classList.remove('hidden'); reasoningShown = true; }
           reasonEl.textContent += ev.text || '';
