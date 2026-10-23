@@ -15,6 +15,16 @@ public record ColumnMeta(string Path, string Type, bool Sortable, string? Keywor
         "half_float", "scaled_float", "unsigned_long", "date", "date_nanos",
         "boolean", "ip", "version"
     };
+
+    /// <summary>数值类型：采样时走 stats/terms 判定用。与字段值采样、工具采样共用一份，
+    /// 避免类型名清单在多处手抄漂移（漏一个类型就静默少采一类字段）。</summary>
+    public static readonly HashSet<string> NumericTypes = new()
+    {
+        "long", "integer", "short", "byte", "double", "float", "half_float", "scaled_float"
+    };
+
+    /// <summary>日期类型。</summary>
+    public static readonly HashSet<string> DateTypes = new() { "date", "date_nanos" };
 }
 
 /// <summary>索引元数据。</summary>

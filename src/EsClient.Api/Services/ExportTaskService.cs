@@ -69,6 +69,9 @@ public class ExportTaskStore
     internal bool TryTakeJob(string taskId, out ExportJob job) =>
         _jobs.TryRemove(taskId, out job!);
 
+    /// <summary>回收已完成任务的条目（随定时清理的文件删除一起），避免 _tasks 无界增长。</summary>
+    internal void RemoveTask(string id) => _tasks.TryRemove(id, out _);
+
     /// <summary>提交导出任务（校验 + 组装 DSL 后入队）。</summary>
     public async Task<ExportTaskInfo> SubmitAsync(ExportRequest req, CancellationToken ct)
     {
@@ -423,7 +426,9 @@ public class ExportTaskService : BackgroundService
                         DateTime.Now - t.CreatedAt > TimeSpan.FromHours(1))
                     {
                         TryDelete(Path.Combine(_exportDir, $"{t.Id}.xlsx"));
-                        t.FileDeleted = true;
+                        // 条目随文件一起回收：否则 _tasks 只增不减，长驻进程稳定泄漏。
+                        // 前端只轮询单个状态并即时下载，列表端点无消费方，移除条目不影响 UI。
+                        _store.RemoveTask(t.Id);
                     }
                 }
             }

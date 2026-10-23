@@ -1,11 +1,11 @@
-import { get, post, toast, fmtNum } from './api.js?v=14';
-import { escapeHtml } from './ui.js?v=14';
-import { renderConnect } from './views/connect.js?v=14';
-import { openConnectModal } from './views/connect.js?v=14';
-import { renderIndices, confirmDeleteIndex } from './views/indices.js?v=14';
-import { renderBrowse, clearBrowseCache } from './views/browse.js?v=14';
-import { renderAiChat } from './views/ai-chat.js?v=16';
-import { openAiSettingsDialog } from './views/ai-settings.js?v=15';
+import { get, post, toast, fmtNum } from './api.js';
+import { escapeHtml } from './ui.js';
+import { renderConnect } from './views/connect.js';
+import { openConnectModal } from './views/connect.js';
+import { renderIndices, confirmDeleteIndex } from './views/indices.js';
+import { renderBrowse, clearBrowseCache } from './views/browse.js';
+import { renderAiChat } from './views/ai-chat.js';
+import { openAiSettingsDialog } from './views/ai-settings.js';
 
 const view = document.getElementById('view');
 

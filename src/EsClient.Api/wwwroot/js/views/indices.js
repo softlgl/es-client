@@ -1,5 +1,5 @@
-import { del, toast, fmtNum } from '../api.js?v=14';
-import { showModal, closeAllModals, modalRoot, escapeHtml } from '../ui.js?v=14';
+import { del, toast, fmtNum } from '../api.js';
+import { showModal, closeAllModals, modalRoot, escapeHtml } from '../ui.js';
 
 // 删除索引确认窗（概览页与侧栏复用）；onDeleted 在删除成功后回调
 export function confirmDeleteIndex(name, docsCount, onDeleted) {

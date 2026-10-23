@@ -126,12 +126,17 @@ public class ConnectController : ControllerBase
     [HttpGet("/api/connection")]
     public IActionResult Connection()
     {
-        var entry = _store.List().FirstOrDefault(e => e.Connected && e.Info.Url == _store.Active?.Info.Url);
+        // Active 只读一次：原写法读两次并在两取锁间靠 Deactivate 竞态会让 entry 变 null，
+        // 叠加 ConnItem(entry!) 的 null 抑制直接 NRE
+        var active = _store.Active;
+        var connections = _store.List();
+        var activeEntry = active == null ? null
+            : connections.FirstOrDefault(e => e.Connected && e.Info.Url == active.Info.Url);
         return Ok(new
         {
-            connected = _store.IsConnected,
-            active = _store.Active == null ? null : ConnItem(entry!),
-            connections = _store.List().Select(ConnItem)
+            connected = activeEntry != null,
+            active = activeEntry == null ? null : ConnItem(activeEntry),
+            connections = connections.Select(ConnItem)
         });
     }
 

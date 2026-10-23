@@ -159,16 +159,12 @@ public class AiSettingsStore
     }
 
     /// <summary>
-    /// 写盘走「临时文件 + 原子替换」，与 ConnectionStore/ChatStore 保持一致。
-    /// 直接覆盖目标文件时若进程中途被杀，文件会被截断，下次启动时 Load 的兜底
-    /// catch 会把整份配置当作未配置处理 —— 表现为「密钥莫名消失」且没有任何线索。
+    /// 写盘走共享的 <see cref="AtomicFile"/>「临时文件 + 原子替换」：直接覆盖目标文件时若进程中途被杀，
+    /// 文件会被截断，下次启动时 Load 的兜底 catch 会把整份配置当作未配置处理（表现为「密钥莫名消失」）。
+    /// 本方法的写入失败不吞——保存 AI 配置这个操作的目的就是落盘，写不进去必须报错让用户重试。
     /// </summary>
-    private void PersistNoLock()
-    {
-        var tmp = _filePath + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(_file, JsonOpts));
-        File.Move(tmp, _filePath, overwrite: true);
-    }
+    private void PersistNoLock() =>
+        AtomicFile.Write(_filePath, JsonSerializer.Serialize(_file, JsonOpts));
 
     private void Load()
     {

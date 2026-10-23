@@ -1,5 +1,5 @@
-import { post, get, toast, fmtNum } from '../api.js?v=14';
-import { escapeHtml, showModal, closeAllModals } from '../ui.js?v=14';
+import { post, get, toast, fmtNum } from '../api.js';
+import { escapeHtml, showModal, closeAllModals } from '../ui.js';
 
 export function openExportDialog({ index, columns, getQuery }) {
   const selected = new Set(columns.map(c => c.path));

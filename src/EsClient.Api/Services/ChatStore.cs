@@ -136,8 +136,6 @@ public class ChatStore
     {
         Directory.CreateDirectory(_dir);
         var path = PathFor(index);
-        var tmp = path + ".tmp";
-        await File.WriteAllTextAsync(tmp, JsonSerializer.Serialize(file, JsonOpts));
-        File.Move(tmp, path, overwrite: true);
+        await AtomicFile.WriteAsync(path, JsonSerializer.Serialize(file, JsonOpts));
     }
 }

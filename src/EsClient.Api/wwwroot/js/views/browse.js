@@ -1,8 +1,8 @@
-import { get, post, toast, fmtNum } from '../api.js?v=14';
-import { escapeHtml, showModal, closeAllModals, modalRoot } from '../ui.js?v=14';
-import { openExportDialog } from './export-dialog.js?v=14';
-import { openAiDialog } from './ai-dialog.js?v=14';
-import { openDocDetail, openNewDocDialog } from './doc-dialog.js?v=14';
+import { get, post, toast, fmtNum } from '../api.js';
+import { escapeHtml, showModal, closeAllModals, modalRoot } from '../ui.js';
+import { openExportDialog } from './export-dialog.js';
+import { openAiDialog } from './ai-dialog.js';
+import { openDocDetail, openNewDocDialog } from './doc-dialog.js';
 
 const OPS = [
   { v: 'eq', label: '等于' }, { v: 'ne', label: '不等于' },

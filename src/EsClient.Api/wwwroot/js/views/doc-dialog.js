@@ -1,5 +1,5 @@
-import { get, post, put, del, toast } from '../api.js?v=14';
-import { escapeHtml, showModal, closeAllModals, modalRoot } from '../ui.js?v=14';
+import { get, post, put, del, toast } from '../api.js';
+import { escapeHtml, showModal, closeAllModals, modalRoot } from '../ui.js';
 
 // 文档查看/编辑/删除与新增文档弹窗。
 // 原先内嵌在 browse.js 的 renderBrowse 闭包里，靠捕获 index 与 load() 运行；

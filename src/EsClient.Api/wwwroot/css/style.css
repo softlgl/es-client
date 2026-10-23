@@ -531,7 +531,8 @@ select.page-size { padding: 5px; border: 1px solid var(--border); border-radius:
 .chat-msg.user .chat-bubble { background: #e8f0fe; border-color: #d3e3fd; }
 .chat-msg.ai .chat-bubble { background: #fff; }
 .chat-answer { white-space: pre-wrap; line-height: 1.6; }
-.chat-status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.chat-status { display: flex; align-items: flex-start; gap: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.chat-status code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
 .chat-gen {
   background: #f6f8fa; border-radius: 6px; padding: 6px 8px; margin-top: 8px;
   font-size: 11px; color: #7a8798; max-height: 120px; overflow: auto; white-space: pre;

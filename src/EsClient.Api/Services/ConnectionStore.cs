@@ -32,13 +32,15 @@ public class ConnectionStore : IDisposable
     private readonly string _filePath;
     private readonly object _lock = new();
     private readonly Dictionary<string, ConnectionEntry> _map = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ILogger<ConnectionStore> _logger;
     private string? _activeId;
 
-    public ConnectionStore(IHostEnvironment env)
+    public ConnectionStore(IHostEnvironment env, ILogger<ConnectionStore> logger)
     {
         var dir = Path.Combine(env.ContentRootPath, "App_Data");
         Directory.CreateDirectory(dir);
         _filePath = Path.Combine(dir, "connections.json");
+        _logger = logger;
         Load();
     }
 
@@ -238,11 +240,14 @@ public class ConnectionStore : IDisposable
                     Major = e.Info.Major
                 }).ToList()
             };
-            var tmp = _filePath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(doc, JsonOpts));
-            File.Move(tmp, _filePath, overwrite: true);
+            AtomicFile.Write(_filePath, JsonSerializer.Serialize(doc, JsonOpts));
         }
-        catch { /* 保存失败不阻塞连接操作 */ }
+        // 落盘失败不影响本次已成功的连接（内存态仍可用），但必须留痕——
+        // 此前是空的 catch{}，用户的连接配置静默丢失却毫无线索
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "连接配置落盘失败（内存态不受影响）：{Path}", _filePath);
+        }
     }
 
     private void Load()
@@ -270,6 +275,10 @@ public class ConnectionStore : IDisposable
                 _map[c.Url] = new ConnectionEntry { Request = request, Info = info, Client = null };
             }
         }
-        catch { /* 文件损坏则忽略，当作无保存 */ }
+        catch (Exception ex)
+        {
+            // 文件损坏/不可读则当作无历史，但留痕以便排查（不静默）
+            _logger.LogWarning(ex, "连接配置读取失败，按空列表处理：{Path}", _filePath);
+        }
     }
 }
