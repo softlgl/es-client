@@ -3,6 +3,7 @@ using System.Text.Json.Nodes;
 using System.Threading.Channels;
 using EsClient.Api.Es;
 using MiniExcelLibs;
+using IConfiguration = Microsoft.Extensions.Configuration.IConfiguration;
 
 namespace EsClient.Api.Services;
 
@@ -124,25 +125,32 @@ public class ExportTaskStore
         List<ColumnMeta> Columns, bool IncludeId, long MaxRows, ConnectRequest Request);
 }
 
-/// <summary>导出后台服务：两个 worker 消费队列（并发 2），scroll 遍历 + MiniExcel 流式写出。</summary>
+/// <summary>导出后台服务：N 个 worker 消费队列（并发度可配，默认 2），scroll 遍历 + MiniExcel 流式写出。</summary>
 public class ExportTaskService : BackgroundService
 {
     private const int ScrollBatchSize = 1000;
     private const string CellTruncateMark = "…[截断]";
     public const int ExcelCellMaxLength = 32767;
+    private const int DefaultConcurrency = 2; // 配置缺失/非法时的回退值
 
     private readonly ILogger<ExportTaskService> _logger;
     private readonly ExportTaskStore _store;
     private readonly ConnectionStore _conn;
     private readonly string _exportDir;
+    private readonly int _concurrency;
 
     public ExportTaskService(ILogger<ExportTaskService> logger, ExportTaskStore store,
-        ConnectionStore conn, IHostEnvironment env)
+        ConnectionStore conn, IConfiguration configuration, IHostEnvironment env)
     {
         _logger = logger;
         _store = store;
         _conn = conn;
         _exportDir = ExportTaskStore.ExportDir;
+        // Export:Concurrency 缺失或 <1 时回退默认 2；上限钳制防止误配拉起过多重 IO worker
+        var n = configuration.GetValue("Export:Concurrency", DefaultConcurrency);
+        _concurrency = Math.Clamp(n, 1, 16);
+        if (_concurrency != n)
+            _logger.LogWarning("导出并发度配置 {Config} 越界，已钳制为 {Fixed}", n, _concurrency);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -151,12 +159,11 @@ public class ExportTaskService : BackgroundService
         CleanupOnStartup();
 
         using var timer = new PeriodicTimer(TimeSpan.FromMinutes(10));
-        var workers = new Task[]
-        {
-            WorkerLoop(stoppingToken),
-            WorkerLoop(stoppingToken),
-            CleanupLoop(timer, stoppingToken)
-        };
+        var workers = Enumerable.Range(0, _concurrency)
+            .Select(_ => WorkerLoop(stoppingToken))
+            .Append(CleanupLoop(timer, stoppingToken))
+            .ToArray();
+        _logger.LogInformation("导出服务启动：{Count} 个 worker 并发消费队列", _concurrency);
         try
         {
             await Task.WhenAll(workers);
