@@ -1,6 +1,6 @@
 using System.Text.Json.Nodes;
 
-namespace EsClient.Api.Controllers;
+namespace EsClient.Api.Services;
 
 /// <summary>
 /// 模型输出 → 可执行请求体的解析与安全约束。
@@ -8,6 +8,7 @@ namespace EsClient.Api.Controllers;
 /// 围栏剥离，外加各自散落在控制器里的白名单与钳制逻辑。集中后有两点好处：
 /// 围栏/截取规则只有一份（不会再分叉），且护栏本身是纯函数、不依赖 HttpContext，
 /// 可以脱离 Web 宿主直接测试 —— 它挡的是模型幻觉与脚本注入，不该埋在控制器里。
+/// 工具回路（AiTools）复用同一份护栏，模型经 run_dsl 提交的 DSL 与主链路同等对待。
 ///
 /// 注意两条链路的策略差异是**有意保留**的：
 /// 问答链路（ExtractSearchBody）执行前会过白名单并拒绝 script；

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using EsClient.Api.Es;
+using EsClient.Api.Services;
 
 namespace EsClient.Api.Controllers;
 
@@ -44,18 +45,18 @@ internal static class SseStream
 
             case OperationCanceledException:
                 // 与客户端取消无关 —— 是 AI 服务侧超时
-                await WriteAsync(response, "error",
+                await WriteAsync(response, SseEvent.Error,
                     new { error = "AI 服务响应超时，请检查接口地址或稍后重试" },
                     CancellationToken.None);
                 return true;
 
             case EsException es:
-                await WriteAsync(response, "error", new { error = es.Message }, ct);
+                await WriteAsync(response, SseEvent.Error, new { error = es.Message }, ct);
                 return true;
 
             default:
                 logger.LogError(ex, "{Context}", context);
-                await WriteAsync(response, "error",
+                await WriteAsync(response, SseEvent.Error,
                     new { error = $"AI 服务调用失败：{ex.Message}" }, ct);
                 return true;
         }

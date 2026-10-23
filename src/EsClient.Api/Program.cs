@@ -8,6 +8,9 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddMemoryCache();
 builder.Services.AddHttpClient();
+// AI 流式读的命名客户端：超时设无限，读流总时长由 AiClient 的 linked CTS（4 分钟）兜底。
+// 不在 connector 里 per-call 改 Timeout —— IHttpClientFactory 返回同一份可配置实例，并发写会抛或互覆盖。
+builder.Services.AddHttpClient("ai", c => c.Timeout = System.Threading.Timeout.InfiniteTimeSpan);
 builder.Services.AddSingleton<ConnectionStore>();
 builder.Services.AddSingleton<AiSettingsStore>();
 builder.Services.AddSingleton<AiClient>();
@@ -19,6 +22,19 @@ builder.Services.AddSingleton<ExportTaskStore>();
 builder.Services.AddHostedService<ExportTaskService>();
 
 var app = builder.Build();
+
+// API 请求日志：方法、路径、状态码、耗时（静态资源不记录，避免噪音）。
+// 必须注册在 UseExceptionHandler 之外（之前），成为最外层：异常在下游被处理器转成响应后正常返回，
+// 这里的 await next() 不会抛出，失败的请求（500）也能记上状态码与耗时——否则日志中间件被异常穿透、这行会跳过。
+app.Use(async (context, next) =>
+{
+    if (!context.Request.Path.StartsWithSegments("/api")) { await next(); return; }
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    await next();
+    context.RequestServices.GetRequiredService<ILogger<Program>>()
+        .LogInformation("{Method} {Path} → {StatusCode} ({Elapsed:F0} ms)",
+            context.Request.Method, context.Request.Path, context.Response.StatusCode, sw.Elapsed.TotalMilliseconds);
+});
 
 // 统一异常 → JSON {error}，同时记录日志（ES 侧错误记 Warning，未知异常记 Error）
 app.UseExceptionHandler(a => a.Run(async context =>
@@ -37,17 +53,6 @@ app.UseExceptionHandler(a => a.Run(async context =>
     context.Response.StatusCode = code;
     await context.Response.WriteAsJsonAsync(new { error = msg });
 }));
-
-// API 请求日志：方法、路径、状态码、耗时（静态资源不记录，避免噪音）
-app.Use(async (context, next) =>
-{
-    if (!context.Request.Path.StartsWithSegments("/api")) { await next(); return; }
-    var sw = System.Diagnostics.Stopwatch.StartNew();
-    await next();
-    context.RequestServices.GetRequiredService<ILogger<Program>>()
-        .LogInformation("{Method} {Path} → {StatusCode} ({Elapsed:F0} ms)",
-            context.Request.Method, context.Request.Path, context.Response.StatusCode, sw.Elapsed.TotalMilliseconds);
-});
 
 app.UseDefaultFiles();
 app.UseStaticFiles(new Microsoft.AspNetCore.Builder.StaticFileOptions

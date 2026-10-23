@@ -1,173 +1,117 @@
-using System.Collections.Concurrent;
-using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using EsClient.Api.Es;
+using EsClient.Api.Services.Chat;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 
 namespace EsClient.Api.Services;
 
 /// <summary>
-/// OpenAI 兼容接口调用封装：流式对话与字段值采样。供 AI 生成查询、AI 问答等功能共用。
+/// AI 访问门面：对 Controller 保持原有 StreamAsync 契约（SSE 双事件回调 + 完整 content），
+/// 内部改走 MEAI 的 IChatClient 管道 —— 自研 OpenAiCompatibleChatClient（HTTP/SSE 解析）
+/// + JsonModeFallbackChatClient（response_format 降级重试中间件）。
+/// 端点配置支持运行时热切换：每次调用比对配置快照，变了就重建客户端链。
+/// 字段值采样（SampleFieldValuesAsync）与 AI 传输无关，留在本类。
 /// </summary>
-public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai)
+public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai, ILoggerFactory loggerFactory)
 {
     public bool IsConfigured => ai.IsConfigured;
 
-    /// <summary>
-    /// 进程内的端点能力档案：已确认不支持 response_format 的 baseUrl+model。
-    /// 只记在内存、不写回配置文件，重启后最多再探测一次；用户在 AI 设置里显式指定的
-    /// 「强制开启/关闭」优先于这里的结论。
-    /// </summary>
-    private static readonly ConcurrentDictionary<string, bool> JsonModeRejected = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>缓存的客户端链与其配置快照键（BaseUrl/ApiKey/Model/ThinkingModel/JsonMode 任一变化即失效）。</summary>
+    private IChatClient? _chain;
+    private string? _chainKey;
+    private readonly object _chainLock = new();
 
     /// <summary>
     /// 以 stream 模式调用上游接口，逐块回调 onEvent("reasoning"/"content", text)，返回完整 content。
     /// thinking 为 true 时优先使用配置的思考模型。
     /// jsonOutput 为 true 表示本次要求模型输出 JSON，请求会带 response_format=json_object：
-    /// 能显著降低围栏/语法错误导致的解析失败，但端点支持度不统一，故不支持时自动降级重试一次
-    /// （结论记入能力档案）。总结、直接回答这类自由文本调用不要开。
+    /// 能显著降低围栏/语法错误导致的解析失败，但端点支持度不统一，故不支持时由降级中间件
+    /// 自动重试一次（结论记入能力档案）。总结、直接回答这类自由文本调用不要开。
     /// </summary>
-    public async Task<string> StreamAsync(List<object> messages, bool thinking,
-        Func<string, string, Task>? onEvent, CancellationToken ct, bool jsonOutput = false)
+    /// <param name="tools">只读工具集（<see cref="AiTools"/> 构建）。非空时启用分步取数回路，
+    /// 模型可多次调用工具后再产出最终 DSL；回调经 onEvent 以 "status" 事件透出工具执行进度。</param>
+    public async Task<string> StreamAsync(List<ChatMessage> messages, bool thinking,
+        Func<string, string, Task>? onEvent, CancellationToken ct, bool jsonOutput = false,
+        IList<AITool>? tools = null)
     {
         var s = ai.Get();
-        var http = httpFactory.CreateClient("ai");
-        http.Timeout = Timeout.InfiniteTimeSpan; // 读流时长自行控制
+        var model = thinking && !string.IsNullOrWhiteSpace(s.ThinkingModel) ? s.ThinkingModel : s.Model;
 
+        var options = new ChatOptions { ModelId = model, Temperature = 0.2f };
+        // 本次是否带 response_format=json_object。三条约束：
+        // ① 只有要求输出 JSON 的调用才开（总结/直接回答是自由文本，开了反而被约束成对象）；
+        // ② 思考模式一律不开——部分推理模型（R1、qwen-thinking）在 JSON 模式下可能返回空 content；
+        // ③ 端点已确认不支持则跳过。
+        // ④ 带工具时不开——工具轮需自由发挥，json_object 会与之冲突（部分端点直接报错）。
+        if (tools is { Count: > 0 })
+        {
+            options.Tools = tools;
+            // 工具执行进度经 onEvent("status", …) 透出（前端 status 事件已有渲染，零协议改动）
+            (options.AdditionalProperties ??= [])[ToolLoopChatClient.StatusCallbackKey] =
+                new Func<string, Task>(t => onEvent?.Invoke(SseEvent.Status, t) ?? Task.CompletedTask);
+        }
+        else if (UseJsonMode(s, model, thinking, jsonOutput))
+            (options.AdditionalProperties ??= [])[JsonModeCapability.ResponseFormatKey] = "json_object";
+
+        // 读流总时长自行控制：HTTP 客户端超时设为无限，这里 4 分钟兜底（客户端主动取消另有 HandleErrorAsync 静默处理）
         using var streamCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         streamCts.CancelAfter(TimeSpan.FromMinutes(4));
 
-        var model = thinking && !string.IsNullOrWhiteSpace(s.ThinkingModel) ? s.ThinkingModel : s.Model;
-        var withJson = UseJsonMode(s, model, thinking, jsonOutput);
-
-        // 发送。带 json_object 且端点拒绝该参数时降级重试一次，最多一次
-        HttpResponseMessage res;
-        while (true)
-        {
-            using var reqMsg = BuildRequest(s, model, messages, withJson);
-            try
-            {
-                res = await http.SendAsync(reqMsg, HttpCompletionOption.ResponseHeadersRead, streamCts.Token);
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new EsException($"无法连接 AI 服务（{s.BaseUrl}）：{ex.Message}", 502);
-            }
-            catch (TaskCanceledException) when (!streamCts.Token.IsCancellationRequested)
-            {
-                throw new EsException("AI 服务响应超时，请检查接口地址或稍后重试", 504);
-            }
-
-            if (res.IsSuccessStatusCode || !withJson) break;
-
-            var status = (int)res.StatusCode;
-            var errText = await res.Content.ReadAsStringAsync(streamCts.Token);
-            var errDetail = TryExtractOpenAiError(errText) ?? errText;
-            res.Dispose();
-            // 用户显式「强制开启」时不擅自降级：让错误直接暴露到界面，由用户决定
-            if (s.JsonMode == true || !LooksLikeJsonModeRejected(status, errDetail))
-                throw new EsException($"AI 服务返回错误（{status}）：{errDetail[..Math.Min(errDetail.Length, 200)]}", 502);
-            JsonModeRejected[EndpointKey(s, model)] = true;
-            withJson = false;
-        }
-
-        if (!res.IsSuccessStatusCode)
-        {
-            var text = await res.Content.ReadAsStringAsync(streamCts.Token);
-            var detail = TryExtractOpenAiError(text) ?? text;
-            res.Dispose();
-            throw new EsException(
-                $"AI 服务返回错误（{(int)res.StatusCode}）：{detail[..Math.Min(detail.Length, 200)]}", 502);
-        }
-
         var contentBuilder = new StringBuilder();
-        try
+        var client = GetChain(s);
+        await foreach (var update in client.GetStreamingResponseAsync(messages, options, streamCts.Token))
         {
-            using var stream = await res.Content.ReadAsStreamAsync(streamCts.Token);
-            using var reader = new StreamReader(stream);
-            while (await reader.ReadLineAsync(streamCts.Token) is { } line)
+            foreach (var item in update.Contents)
             {
-                if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
-                var data = line[5..].Trim();
-                if (data == "[DONE]") break;
-
-                JsonNode? chunk;
-                try { chunk = JsonNode.Parse(data); } catch { continue; }
-
-                // qwen 等会先发一个 choices 为空数组的 chunk，需跳过
-                var choices = chunk?["choices"] as JsonArray;
-                var delta = choices is { Count: > 0 } ? choices[0]?["delta"] : null;
-                if (delta == null) continue;
-
-                // 推理模型（DeepSeek-R1 等）的思考过程字段；qwen 会显式发 "content": null，须安全取值
-                var reasoning = NodeStr(delta["reasoning_content"]) ?? NodeStr(delta["reasoning"]);
-                if (!string.IsNullOrEmpty(reasoning) && onEvent != null)
-                    await onEvent("reasoning", reasoning);
-
-                var piece = NodeStr(delta["content"]);
-                if (!string.IsNullOrEmpty(piece))
+                switch (item)
                 {
-                    contentBuilder.Append(piece);
-                    if (onEvent != null) await onEvent("content", piece);
+                    case TextReasoningContent r when r.Text.Length > 0 && onEvent != null:
+                        await onEvent(SseEvent.Reasoning, r.Text);
+                        break;
+                    case TextContent t when t.Text.Length > 0:
+                        contentBuilder.Append(t.Text);
+                        if (onEvent != null) await onEvent(SseEvent.Content, t.Text);
+                        break;
                 }
             }
-        }
-        finally
-        {
-            res.Dispose();
         }
         return contentBuilder.ToString();
     }
 
-    /// <summary>
-    /// 本次请求是否带 response_format=json_object。三条约束：
-    /// ① 只有要求输出 JSON 的调用才开（总结/直接回答是自由文本，开了反而被约束成对象）；
-    /// ② 思考模式一律不开——部分推理模型（R1、qwen-thinking）在 JSON 模式下可能返回空 content；
-    /// ③ 端点已确认不支持则跳过。
-    /// </summary>
+    /// <summary>取当前配置对应的客户端链；配置快照变化（保存/切换模型）时重建。</summary>
+    private IChatClient GetChain(AiModelConfig s)
+    {
+        var key = $"{s.BaseUrl}|{s.ApiKey}|{s.Model}|{s.ThinkingModel}|{s.JsonMode}";
+        lock (_chainLock)
+        {
+            if (_chainKey != key || _chain == null)
+            {
+                // 由内到外：connector（HTTP/SSE）→ 降级中间件 → 工具回路（最外层，产出 status 事件并重发）
+                _chain = new ToolLoopChatClient(
+                    new JsonModeFallbackChatClient(
+                        new OpenAiCompatibleChatClient(httpFactory, s.BaseUrl, s.ApiKey),
+                        s.JsonMode == true, s.BaseUrl),
+                    loggerFactory.CreateLogger<ToolLoopChatClient>());
+                _chainKey = key;
+            }
+            return _chain;
+        }
+    }
+
+    /// <summary>本次请求是否带 response_format=json_object，判定规则见 StreamAsync 内注释。</summary>
     private static bool UseJsonMode(AiModelConfig s, string model, bool thinking, bool jsonOutput)
     {
         if (!jsonOutput || thinking || s.JsonMode == false) return false;
-        return s.JsonMode == true || !JsonModeRejected.ContainsKey(EndpointKey(s, model));
+        return s.JsonMode == true || !JsonModeCapability.Rejected.ContainsKey(JsonModeCapability.EndpointKey(s.BaseUrl, model));
     }
-
-    /// <summary>能力档案的键：同一端点不同模型的支持度可能不同，故模型名也要进键。</summary>
-    private static string EndpointKey(AiModelConfig s, string model) => $"{s.BaseUrl.TrimEnd('/')}|{model}";
 
     /// <summary>
-    /// 判断 4xx 是否由 response_format 引起。宁可漏判（照常报错）不误判：降级重试最多一次，
-    /// 且降级后仍失败会照常抛错，误判的代价只是多发一次请求，不会掩盖真实错误。
+    /// 对可精确匹配的字段做 terms/stats 聚合采样，供 AI 选择真实存在的字段与值。
+    /// 与 AI 传输无关（纯 ES 查询），因属 AI 链路的辅助步骤而留在此类。
     /// </summary>
-    private static bool LooksLikeJsonModeRejected(int status, string detail)
-    {
-        if (status is not (400 or 422 or 501)) return false;
-        var d = detail.ToLowerInvariant();
-        return d.Contains("response_format") || d.Contains("json_object") || d.Contains("json mode")
-            || d.Contains("unsupported") || d.Contains("not supported")
-            || d.Contains("unknown parameter") || d.Contains("unrecognized");
-    }
-
-    private static HttpRequestMessage BuildRequest(AiModelConfig s, string model,
-        List<object> messages, bool withJson)
-    {
-        var reqMsg = new HttpRequestMessage(HttpMethod.Post, $"{s.BaseUrl.TrimEnd('/')}/chat/completions");
-        reqMsg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", s.ApiKey);
-        var body = new JsonObject
-        {
-            ["model"] = model,
-            ["messages"] = new JsonArray([.. messages.Select(m => JsonSerializer.SerializeToNode(m))]),
-            ["temperature"] = 0.2,
-            ["stream"] = true
-        };
-        // OpenAI 系还要求 messages 里出现 "json" 字样才允许该参数，本项目的生成类提示词均已包含
-        if (withJson)
-            body["response_format"] = new JsonObject { ["type"] = "json_object" };
-        reqMsg.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-        return reqMsg;
-    }
-
-    /// <summary>对可精确匹配的字段做 terms/stats 聚合采样，供 AI 选择真实存在的字段与值。</summary>
     public async Task<Dictionary<string, string[]>> SampleFieldValuesAsync(
         EsHttpClient client, string index, IndexMeta meta, CancellationToken ct)
     {
@@ -185,12 +129,12 @@ public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai)
                 .Take(12)
                 .ToList();
             var numeric = meta.Columns
-                .Where(c => !IsNested(c) && c.Type is "long" or "integer" or "short" or "byte" or "double" or "float" or "half_float" or "scaled_float")
+                .Where(c => !IsNested(c) && ColumnMeta.NumericTypes.Contains(c.Type))
                 .Select(c => c.Path)
                 .Take(4);
             fields.AddRange(numeric.Except(fields));
             var dates = meta.Columns
-                .Where(c => !IsNested(c) && c.Type is "date" or "date_nanos")
+                .Where(c => !IsNested(c) && ColumnMeta.DateTypes.Contains(c.Type))
                 .Select(c => c.Path)
                 .Take(3);
             fields.AddRange(dates.Except(fields));
@@ -256,10 +200,11 @@ public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai)
         return DateTimeOffset.FromUnixTimeMilliseconds((long)ms).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ");
     }
 
-    /// <summary>安全读取 JsonNode 字符串（缺失 / JSON null / 非字符串均返回 null）。</summary>
+    /// <summary>安全读取 JsonNode 字符串（缺失 / JSON null / 非字符串均返回 null）。供 connector 解析 SSE 使用。</summary>
     public static string? NodeStr(JsonNode? node) =>
         node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 
+    /// <summary>从上游错误响应体里提取 OpenAI 格式的 error.message，供错误文案与降级判定使用。</summary>
     public static string? TryExtractOpenAiError(string body)
     {
         try
