@@ -67,9 +67,15 @@ export async function renderAiChat(view, index) {
         <label class="chat-ctrl" title="开启后使用思考模型生成查询">
           <input type="checkbox" id="chat-thinking"> 思考模式
         </label>
-        <label class="chat-ctrl" title="开启后 AI 可分步调用只读工具（临时查询/计数/采样）探索数据再收敛，适合复杂多层下钻问题">
-          <input type="checkbox" id="chat-tools"> 工具探索
-        </label>
+        <span class="tools-seg" title="AI 分步调用只读工具（临时查询/计数/采样）探索数据再收敛：关闭＝从不；自动＝按问题智能开启；强制＝每轮都探索">
+          工具探索
+          <span class="seg" role="group">
+            <button type="button" class="seg-btn" data-tools="off">关闭</button>
+            <button type="button" class="seg-btn active" data-tools="auto">自动</button>
+            <button type="button" class="seg-btn" data-tools="force">强制</button>
+          </span>
+          <span class="tools-hint" id="chat-tools-hint"></span>
+        </span>
       </div>
       <div class="chat-msgs" id="chat-msgs"></div>
       <div class="chat-input-row">
@@ -88,14 +94,50 @@ export async function renderAiChat(view, index) {
   const input = view.querySelector('#chat-input');
   const sendBtn = view.querySelector('#chat-send');
   const thinkCb = view.querySelector('#chat-thinking');
-  const toolsCb = view.querySelector('#chat-tools');
+  const toolsHint = view.querySelector('#chat-tools-hint');
+  const toolsBtns = [...view.querySelectorAll('.seg-btn')];
 
   thinkCb.checked = localStorage.getItem('ai-thinking') !== '0';
   thinkCb.addEventListener('change', () =>
     localStorage.setItem('ai-thinking', thinkCb.checked ? '1' : '0'));
-  toolsCb.checked = localStorage.getItem('ai-tools') === '1';
-  toolsCb.addEventListener('change', () =>
-    localStorage.setItem('ai-tools', toolsCb.checked ? '1' : '0'));
+
+  // 工具探索三态：off=从不；force=每轮都探索；auto=发送时按问题形态智能决定（默认）。
+  // 用显式分段控件取代“会自翻转的复选框”，模式与本轮预判都看得见、无隐性动作。
+  let toolsMode = (() => {
+    const raw = localStorage.getItem('ai-tools-mode');
+    if (raw === 'off' || raw === 'auto' || raw === 'force') return raw;
+    // 迁移旧版（auto/manual + boolean）：manual 固定过 → 按其末次值映射 force/off，否则 auto
+    return raw === 'manual' ? (localStorage.getItem('ai-tools') === '1' ? 'force' : 'off') : 'auto';
+  })();
+
+  // 规则分类（便宜的关键词/问题形态判断，不引入额外模型调用）：仅明显多步/探因/对比/下钻才默认开启，
+  // 简单计数/列举/TopN 一次查询即可 → 保持关闭，避免徒增延迟与 token。
+  function looksExploratory(q) {
+    if (!q) return false;
+    return /(为什么|为啥|原因|怎么回事|什么情况下|啥情况|对比|比较|相比|差异|区别|哪些.*(异常|问题|原因|慢)|哪几|哪个|哪一|异常|骤降|突增|飙升|波动|明显下降|下钻|细分|验证|核对|排查|先.+(再|然后|接着)|是不是因|是否因)/.test(q);
+  }
+
+  // 本轮实际是否下发工具：force 恒真、off 恒假、auto 看问题预判
+  function toolsEffective(q) {
+    return toolsMode === 'force' || (toolsMode === 'auto' && looksExploratory(q));
+  }
+
+  function syncToolsUi() {
+    toolsBtns.forEach(b => b.classList.toggle('active', b.dataset.tools === toolsMode));
+    // 仅自动模式需显示「本轮预判」；off/force 由高亮按钮已说明，清空避免冗余
+    if (toolsMode === 'auto') {
+      const q = input.value.trim();
+      toolsHint.textContent = !q ? '· 按问题自动' : (looksExploratory(q) ? '· 本轮将启用' : '· 本轮不启用');
+    } else toolsHint.textContent = '';
+  }
+
+  toolsBtns.forEach(b => b.addEventListener('click', () => {
+    toolsMode = b.dataset.tools;
+    localStorage.setItem('ai-tools-mode', toolsMode);
+    syncToolsUi();
+  }));
+  input.addEventListener('input', syncToolsUi);
+  syncToolsUi();
 
   view.querySelector('#vs-browse').addEventListener('click', () => {
     location.hash = `#/browse/${encodeURIComponent(index)}`;
@@ -403,7 +445,7 @@ export async function renderAiChat(view, index) {
     try {
       // onEvent 返回 false 表示已收尾（收到 done/error）
       const settled = await streamSse(`/api/ai/chat/${encodeURIComponent(index)}`, {
-        sessionId, question, thinking: thinkCb.checked, tools: toolsCb.checked, timeZone,
+        sessionId, question, thinking: thinkCb.checked, tools: toolsEffective(question), timeZone,
         currentQuery: browseContext
       }, abortCtl.signal, async ev => {
         if (ev.type === 'status') {
