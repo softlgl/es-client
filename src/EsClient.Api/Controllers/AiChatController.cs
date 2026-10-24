@@ -116,7 +116,9 @@ public class AiChatController : ControllerBase
 
             var messages = new List<ChatMessage> { new(ChatRole.System, AiPrompts.ChatGenerateSystem(req.Tools == true)) };
             foreach (var t in historyTurns)
-                messages.Add(new ChatMessage(new ChatRole(t.Role), t.Text));
+                // assistant 轮附上上轮查询结果数据（带查询时间与时效告警），让模型能看着数据回答、避免重复调工具
+                messages.Add(new ChatMessage(new ChatRole(t.Role),
+                    t.Role == "assistant" ? AiPrompts.HistoryAssistantText(t.Text, t.Data, t.Time) : t.Text));
             messages.Add(new ChatMessage(ChatRole.User,
                 AiPrompts.ChatGenerateUser(index, meta, samples, question, req.TimeZone, req.CurrentQuery)));
 

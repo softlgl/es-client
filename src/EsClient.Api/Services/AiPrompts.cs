@@ -91,7 +91,8 @@ public static class AiPrompts
         输出：{"query":{"match_all":{}},"size":5,"sort":[{"amount":{"order":"desc"}}],"_source":["status","amount"]}
         """ + (withTools ? """
         【分步取数】本轮你可以调用只读工具（run_dsl 执行临时查询、count_docs 统计命中数、sample_field_values 采样字段值）来边探索边收敛：
-        - 字段是否存在、某筛选条件命中多少、真实取值有哪些 —— 不确定时先用工具探一次，再据结果收敛出最终 DSL。
+        - 优先用上下文理解口径，但对时效保持警惕：上轮历史与其中的「上轮查询结果」多用于理解字段取值、筛选口径、下钻方向 —— 这些可放心复用，别再为"确认一下"而重复采样或探索；但那是当时的快照，凡本轮问「当前/最新/实时/今天」或索引在持续写入，最终 DSL 仍要照常查询取新值，不要照搬历史数字。仅当确实缺少关键数据或口径真的不确定时，才用工具补取一次。
+        - 字段是否存在、某筛选条件命中多少、真实取值有哪些 —— 在上下文确实没有时先用工具探一次，再据结果收敛出最终 DSL。
         - 需要多层下钻（如先看每天趋势、再定位异常日、再细查那天）时，用工具逐步取数。
         - 「为什么/原因/对比某项异常」类问题：先用工具定位到关键项（如骤降的那几个业务），最终 DSL 只对这些关键项做聚焦对照，不要把全量透视当最终结果倒出来。
         - 工具只读、安全，可放心多次调用；但不要在能一步到位的简单问题上滥用工具徒增延迟。
@@ -146,6 +147,22 @@ public static class AiPrompts
         }
         sb.Append($"本轮问题：{question}\n\nES 查询结果 JSON：\n{result.ToJsonString()}");
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// 重建问答历史时的 assistant 文本：除总结话术外，附上上一轮实际的查询结果表格（<see cref="ChatStore.ChatTurn.Data"/>），
+    /// 让模型能直接引用真实数字而无需重复查。此前只喂回被压到 ≤150 字的话术，用户在界面上看到的
+    /// 完整表格模型却看不到，导致“能从上文得到答案却仍去调工具”的过度查询。数据缺失（直接回答/无表格）时仅返回话术。
+    /// 因那是当时的快照，附查询时间与时效告警：口径/取值/下钻方向可复用，但时效类数字必须重查，避免旧数据误导。
+    /// </summary>
+    public static string HistoryAssistantText(string answer, JsonNode? data, DateTimeOffset queriedAt)
+    {
+        if (data is null) return answer;
+        var age = DateTimeOffset.Now - queriedAt;
+        var ageText = age.TotalHours >= 1 ? $"{age.TotalHours:F1} 小时前"
+            : age.TotalMinutes >= 1 ? $"{age.TotalMinutes:F0} 分钟前" : "刚刚";
+        return $"{answer}\n\n（上轮查询结果（查询于 {queriedAt:yyyy-MM-dd HH:mm}，{ageText}，为当时快照、可能已变动）：\n{data.ToJsonString()}\n"
+            + "可用于理解口径/字段取值/下钻方向；但其中数字是当时快照，本轮若问当前/最新/实时/今天或该索引在持续写入，仍需照常查询取新值，不要照搬下列数字。）";
     }
 
     public static string ChatGenerateUser(string index, IndexMeta meta,
