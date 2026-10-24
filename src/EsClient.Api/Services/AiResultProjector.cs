@@ -55,7 +55,9 @@ internal static class AiResultProjector
                 if (h?["_source"] is JsonObject src)
                     foreach (var (k, v) in src)
                     {
-                        var s = v?.ToJsonString() ?? "null";
+                        // 字符串值直接取原文：ToJsonString 会把已是 JSON 的字段值（日志类索引常见）再序列化
+                        // 一层，转义引号 \" 泄进展示与模型文本
+                        var s = CellText(v) ?? "null";
                         if (s.Length > cellMax) s = s[..cellMax] + "…";
                         row[k] = s;
                     }
@@ -278,8 +280,8 @@ internal static class AiResultProjector
                 var val = agg?["value"];
                 if (val != null && (val is JsonValue || val is JsonObject))
                 {
-                    var s = val is JsonObject vo ? vo["value"]?.ToJsonString() : val.ToJsonString();
-                    if (!string.IsNullOrWhiteSpace(s)) metricRows.Add(new JsonArray([name, s.Trim('"')]));
+                    var s = CellText(val is JsonObject vo ? vo["value"] : val);
+                    if (!string.IsNullOrWhiteSpace(s)) metricRows.Add(new JsonArray([name, s!]));
                 }
             }
             if (metricRows.Count > 0)
@@ -302,7 +304,9 @@ internal static class AiResultProjector
             var r = new JsonArray();
             foreach (var c in cols)
             {
-                var s = src?[c]?.ToJsonString().Trim('"') ?? "";
+                var s = CellText(src?[c]) ?? "";
+                // 前端表格是纯展示面：源文档字段本身存 JSON 字符串时解开一层，\" 不再泄进单元格
+                s = JsonDisplayUnwrapper.Unwrap(s);
                 if (s.Length > 60) s = s[..60] + "…";
                 r.Add(s);
             }
@@ -319,4 +323,13 @@ internal static class AiResultProjector
             ["truncated"] = (res["hits"]?["total"]?["value"]?.GetValue<long>() ?? 0) > tableRows.Count
         };
     }
+
+    /// <summary>
+    /// 单元格取文本：字符串值直接给原文（不重走 JSON 序列化，避免字段值本身是 JSON 时
+    /// 被叠一层 \" 转义泄进展示）；数组/对象等非字符串值仍是合法 JSON，序列化展示。
+    /// </summary>
+    private static string? CellText(JsonNode? v) =>
+        v is null ? null
+        : v is JsonValue jv && jv.TryGetValue<string>(out var s) ? s
+        : v.ToJsonString();
 }

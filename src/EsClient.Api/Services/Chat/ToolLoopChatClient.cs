@@ -101,12 +101,14 @@ public sealed class ToolLoopChatClient(IChatClient inner, ILogger logger, int ma
                 .FirstOrDefault(f => string.Equals(f.Name, call.Name, StringComparison.Ordinal));
 
             var argsPreview = FormatArgs(call.Arguments);
+            // 展示/日志用迭代解包内嵌 JSON（模型双重编码、源数据自带转义都剥掉）；日志里 {Args} 走模板不转义，status 文本需干净
+            var argsDisp = JsonDisplayUnwrapper.Unwrap(argsPreview);
             if (status != null)
                 await status(fn is null
                     ? $"模型请求了未知工具 {call.Name}"
-                    : $"🔧 {AiTools.DisplayName(call.Name)} ← {Truncate(argsPreview, 120)}");
+                    : $"🔧 {AiTools.DisplayName(call.Name)} ← {Truncate(argsDisp, 120)}");
 
-            logger.LogInformation("工具调用 {Tool} args={Args}", call.Name, argsPreview);
+            logger.LogInformation("工具调用 {Tool} args={Args}", call.Name, argsDisp);
 
             object? result;
             Exception? error = null;
@@ -124,15 +126,18 @@ public sealed class ToolLoopChatClient(IChatClient inner, ILogger logger, int ma
             sw.Stop();
 
             var resultStr = result?.ToString() ?? "";
+            // 预览用解包后文本（否则 status 整段是字符串，传输再转义一层、前端原样显示 \"）；
+            // 回填给模型的 FunctionResultContent 仍用原样合法 JSON
+            var previewStr = JsonDisplayUnwrapper.Unwrap(resultStr);
             if (error != null)
                 logger.LogWarning(error, "工具 {Tool} 执行失败（{ElapsedMs}ms）", call.Name, sw.ElapsedMilliseconds);
             else
-                logger.LogInformation("工具 {Tool} 完成（{ElapsedMs}ms）→ {Result}", call.Name, sw.ElapsedMilliseconds, Truncate(resultStr, 500));
+                logger.LogInformation("工具 {Tool} 完成（{ElapsedMs}ms）→ {Result}", call.Name, sw.ElapsedMilliseconds, Truncate(previewStr, 500));
 
             if (error != null && status != null)
                 await status($"🔧 {AiTools.DisplayName(call.Name)} ✗ {Truncate(error.Message, 80)}");
             else if (status != null)
-                await status($"🔧 {AiTools.DisplayName(call.Name)} → {Truncate(resultStr, 200)}");
+                await status($"🔧 {AiTools.DisplayName(call.Name)} → {Truncate(previewStr, 200)}");
 
             msg.Contents.Add(new FunctionResultContent(call.CallId ?? "", error != null ? null : result) { Exception = error });
         }
