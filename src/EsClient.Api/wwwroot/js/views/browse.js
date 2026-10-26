@@ -144,6 +144,11 @@ export async function renderBrowse(view, index) {
             <span class="idx-name">${escapeHtml(index)}</span>
             <span class="docs" id="docs-info"></span>
             <span class="spacer"></span>
+            <select class="sort-field" id="sort-field" title="排序字段（默认按 _doc 存储顺序）"></select>
+            <select class="sort-dir" id="sort-dir" title="排序方向">
+              <option value="asc">升序 ▲</option>
+              <option value="desc">降序 ▼</option>
+            </select>
             <select class="page-size" id="page-size">
               ${[10, 25, 50, 100, 200].map(n =>
                 `<option value="${n}" ${n === state.pageSize ? 'selected' : ''}>${n} 条/页</option>`).join('')}
@@ -266,6 +271,7 @@ export async function renderBrowse(view, index) {
     state.queryString = '';
     if ($('#dsl-input')) { $('#dsl-input').value = ''; state.dslText = ''; }
     state.sort = null;
+    syncSortUi();
     drawConditions();
     updateHint();
     resetPages();
@@ -323,6 +329,37 @@ export async function renderBrowse(view, index) {
   }
 
   // ---------- 工具条 ----------
+  // 排序控件：与表头点击共用 state.sort（唯一事实源），任何入口变更都走 syncSortUi 回显。
+  // 空值=默认（后端仅 _doc；DSL 模式则尊重 DSL 内 sort），语义与点表头循环到「取消排序」一致
+  const sortCols = meta.columns.filter(c => c.sortable);
+  function syncSortUi() {
+    const sf = $('#sort-field'), sd = $('#sort-dir');
+    if (!sf || !sd) return;
+    sf.innerHTML = `<option value="">默认排序</option>` +
+      sortCols.map(c =>
+        `<option value="${escapeHtml(c.path)}">${escapeHtml(c.path)} (${c.type})</option>`).join('');
+    sf.value = state.sort?.field ?? '';
+    // 排序字段不在可排序列表（如 mapping 变更后残留旧状态）：清空，与后端校验口径一致
+    if (state.sort && sf.value !== state.sort.field) {
+      state.sort = null;
+      sf.value = '';
+    }
+    sd.value = state.sort?.dir === 'desc' ? 'desc' : 'asc';
+    sd.disabled = !state.sort;
+  }
+  syncSortUi();
+  $('#sort-field').addEventListener('change', e => {
+    const f = e.target.value;
+    state.sort = f ? { field: f, dir: $('#sort-dir').value === 'desc' ? 'desc' : 'asc' } : null;
+    resetPages();
+    load();
+  });
+  $('#sort-dir').addEventListener('change', () => {
+    if (!state.sort) return;
+    state.sort.dir = $('#sort-dir').value;
+    resetPages();
+    load();
+  });
   $('#page-size').addEventListener('change', e => {
     state.pageSize = +e.target.value;
     // DSL 模式下 size 就写在 DSL 里，改下拉框必须同步改写它，否则表格行数不变、
@@ -542,11 +579,13 @@ export async function renderBrowse(view, index) {
 
     wrap.querySelectorAll('th.sortable').forEach(th => th.addEventListener('click', () => {
       const f = th.dataset.field;
+      // 排序统一以 state.sort 为准：点表头/下拉框任一入口改了它，另一处经 syncSortUi 同步显示
       if (state.sort?.field === f) {
         state.sort = state.sort.dir === 'asc' ? { field: f, dir: 'desc' } : null;
       } else {
         state.sort = { field: f, dir: 'asc' };
       }
+      syncSortUi();
       resetPages();
       load();
     }));

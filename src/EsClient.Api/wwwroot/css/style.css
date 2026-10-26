@@ -411,7 +411,11 @@ table.data td._id-cell { color: var(--muted); font-family: Consolas, monospace; 
 .pagination input[type=number] {
   width: 64px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px;
 }
-select.page-size { padding: 5px; border: 1px solid var(--border); border-radius: 5px; }
+select.page-size, select.sort-field, select.sort-dir {
+  padding: 5px; border: 1px solid var(--border); border-radius: 5px;
+}
+select.sort-field { max-width: 220px; text-overflow: ellipsis; } /* 字段路径可能很长，限宽防工具条被挤爆 */
+select.sort-dir:disabled { opacity: .5; }
 
 /* ---------- 弹窗 ---------- */
 .modal-mask {
