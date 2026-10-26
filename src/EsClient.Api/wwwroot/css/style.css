@@ -575,6 +575,29 @@ select.page-size { padding: 5px; border: 1px solid var(--border); border-radius:
 .chat-dsl pre .j-str { color: #116329; }
 .chat-dsl pre .j-kw { color: #8250df; font-weight: 600; }
 .chat-dsl pre .j-num { color: #b35900; }
+/* 工具探索留痕（回答后保留的可折叠摘要） */
+.chat-steps { margin-top: 10px; font-size: 12px; }
+.chat-steps summary { cursor: pointer; color: var(--muted); user-select: none; }
+.chat-steps summary:hover { color: var(--text); }
+.cs-list { margin: 6px 0; padding-left: 18px; color: var(--muted); }
+.cs-list li { margin: 3px 0; line-height: 1.5; }
+.cs-name { color: var(--primary); font-weight: 600; margin-right: 4px; }
+.cs-args, .cs-res { font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; }
+.cs-args { color: #0550ae; }
+.cs-arrow { margin: 0 4px; color: var(--muted); }
+.cs-res { color: #116329; word-break: break-all; }
+.cs-res.cs-fail { color: #c0392b; }
+.cs-ms { margin-left: 6px; color: var(--muted); font-size: 11px; }
+/* 思考过程（回答后保留的可折叠全文，与流式期间的 .chat-reasoning 实时区区分） */
+.chat-reasoning-block { margin-top: 10px; font-size: 12px; }
+.chat-reasoning-block summary { cursor: pointer; color: var(--muted); user-select: none; }
+.chat-reasoning-block summary:hover { color: var(--text); }
+.cr-text {
+  background: #f6f8fa; border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; margin: 6px 0; font-size: 12px; max-height: 200px; overflow: auto;
+  white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace;
+  color: var(--muted);
+}
 .chat-actions { display: flex; gap: 8px; margin-top: 10px; }
 .chat-actions .btn { padding: 4px 12px; font-size: 12px; }
 .chat-input-row {

@@ -19,8 +19,15 @@ namespace EsClient.Api.Services.Chat;
 /// </summary>
 public sealed class ToolLoopChatClient(IChatClient inner, ILogger logger, int maxIterations = 4) : DelegatingChatClient(inner)
 {
-    /// <summary>ChatOptions.AdditionalProperties 保留键：工具执行提示回调 Func<string,Task>（门面注入，可空）。</summary>
+    /// <summary>ChatOptions.AdditionalProperties 保留键：工具执行提示回调 Func&lt;string,Task&gt;（门面注入，可空）。</summary>
     public const string StatusCallbackKey = "esclient.tool_status";
+
+    /// <summary>ChatOptions.AdditionalProperties 保留键：工具步骤收集回调 Action&lt;ToolStep&gt;（门面注入，可空）。
+    /// 与 status 文本事件并存——status 供流式实时展示，本收集供整轮结束后随问答落库、历史重放成折叠摘要。</summary>
+    public const string ToolStepsKey = "esclient.tool_steps";
+
+    /// <summary>单次工具调用的结构化留痕：展示名、参数预览、结果预览、是否成功、耗时。字符串已在收集处截断。</summary>
+    public sealed record ToolStep(string Name, string Display, string Args, string Result, bool Ok, long ElapsedMs);
 
     public override async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages,
         ChatOptions? options = null, CancellationToken ct = default)
@@ -90,9 +97,14 @@ public sealed class ToolLoopChatClient(IChatClient inner, ILogger logger, int ma
         ChatOptions? options, CancellationToken ct)
     {
         Func<string, Task>? status = null;
-        if (options?.AdditionalProperties != null &&
-            options.AdditionalProperties.TryGetValue(StatusCallbackKey, out var cb) &&
-            cb is Func<string, Task> act) status = act;
+        Action<ToolStep>? collect = null;
+        if (options?.AdditionalProperties != null)
+        {
+            if (options.AdditionalProperties.TryGetValue(StatusCallbackKey, out var cb) && cb is Func<string, Task> act)
+                status = act;
+            if (options.AdditionalProperties.TryGetValue(ToolStepsKey, out var scb) && scb is Action<ToolStep> act2)
+                collect = act2;
+        }
 
         var msg = new ChatMessage(ChatRole.Assistant, new List<AIContent>());
         foreach (var call in calls)
@@ -138,6 +150,12 @@ public sealed class ToolLoopChatClient(IChatClient inner, ILogger logger, int ma
                 await status($"🔧 {AiTools.DisplayName(call.Name)} ✗ {Truncate(error.Message, 80)}");
             else if (status != null)
                 await status($"🔧 {AiTools.DisplayName(call.Name)} → {Truncate(previewStr, 200)}");
+
+            // 留痕落库（可空收集）：参数/结果按展示口径截断，控制会话文件体积
+            collect?.Invoke(new ToolStep(call.Name, AiTools.DisplayName(call.Name),
+                Truncate(argsDisp, 200),
+                error != null ? Truncate(error.Message, 200) : Truncate(previewStr, 400),
+                error == null, sw.ElapsedMilliseconds));
 
             msg.Contents.Add(new FunctionResultContent(call.CallId ?? "", error != null ? null : result) { Exception = error });
         }

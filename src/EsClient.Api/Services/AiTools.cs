@@ -24,8 +24,6 @@ public static class AiTools
                              "参数 dsl 为一个 JSON 对象字符串，顶层可用键：query、aggs、size、sort、_source。禁止 script。"),
             AIFunctionFactory.Create(CountDocsAsync, name: "count_docs",
                 description: "统计当前索引中满足 query 的文档总数（不取回文档，成本低）。参数 query 为单个 query 子句的 JSON 字符串。"),
-            AIFunctionFactory.Create(SampleFieldAsync, name: "sample_field_values",
-                description: "采样某字段的真实取值（keyword/terms 取高频值，数值/日期取区间），用于确认字段是否有序号/拼写/可选值。参数 field 为字段完整路径。"),
         ];
 
         // —— 工具实现（局部函数，参数名会进 JSON Schema 供模型填参）——
@@ -57,34 +55,6 @@ public static class AiTools
             }
             catch (EsException ex) { return ErrorJson(ex.Message); }
         }
-
-        async Task<string> SampleFieldAsync(string field)
-        {
-            var col = meta.Columns.FirstOrDefault(c =>
-                string.Equals(c.Path, field, StringComparison.OrdinalIgnoreCase));
-            var aggField = col?.KeywordPath ?? field;
-            // 数值/日期走 stats 取区间，其余走 terms 取高频值——类型清单与采样、AI 生成共用一份，避免手抄漂移
-            var isNumeric = col != null && (ColumnMeta.NumericTypes.Contains(col.Type) || ColumnMeta.DateTypes.Contains(col.Type));
-            var agg = isNumeric
-                ? new JsonObject { ["stats"] = new JsonObject { ["field"] = field } }
-                : new JsonObject { ["terms"] = new JsonObject { ["field"] = aggField, ["size"] = 8 } };
-            try
-            {
-                var res = await client.SearchAsync(index,
-                    new JsonObject { ["size"] = 0, ["aggs"] = new JsonObject { ["a0"] = agg } }, ct);
-                var a0 = res?["aggregations"]?["a0"];
-                if (isNumeric)
-                    return new JsonObject
-                    {
-                        ["min"] = a0?["min"]?.DeepClone(), ["max"] = a0?["max"]?.DeepClone(),
-                        ["avg"] = a0?["avg"]?.DeepClone(), ["count"] = a0?["count"]?.DeepClone()
-                    }.ToJsonString();
-                var buckets = a0?["buckets"] as JsonArray;
-                var values = buckets?.Select(b => b?["key"]?.DeepClone() ?? (JsonNode)"").ToArray() ?? [];
-                return new JsonObject { ["values"] = new JsonArray(values) }.ToJsonString();
-            }
-            catch (EsException ex) { return ErrorJson(ex.Message); }
-        }
     }
 
     private static string ErrorJson(string msg) => new JsonObject { ["error"] = msg }.ToJsonString();
@@ -98,7 +68,6 @@ public static class AiTools
     {
         "run_dsl" => "执行临时查询",
         "count_docs" => "统计命中数",
-        "sample_field_values" => "采样字段值",
         _ => name
     };
 }

@@ -33,9 +33,11 @@ public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai, ILogge
     /// </summary>
     /// <param name="tools">只读工具集（<see cref="AiTools"/> 构建）。非空时启用分步取数回路，
     /// 模型可多次调用工具后再产出最终 DSL；回调经 onEvent 以 "status" 事件透出工具执行进度。</param>
+    /// <param name="toolSteps">可选收集容器：带工具时把每次工具调用的结构化留痕追加进来，
+    /// 供调用方（问答控制器）整轮结束后随回答落库、历史重放成可折叠摘要。与流式 status 事件解耦。</param>
     public async Task<string> StreamAsync(List<ChatMessage> messages, bool thinking,
         Func<string, string, Task>? onEvent, CancellationToken ct, bool jsonOutput = false,
-        IList<AITool>? tools = null)
+        IList<AITool>? tools = null, IList<ToolLoopChatClient.ToolStep>? toolSteps = null)
     {
         var s = ai.Get();
         var model = thinking && !string.IsNullOrWhiteSpace(s.ThinkingModel) ? s.ThinkingModel : s.Model;
@@ -50,8 +52,12 @@ public class AiClient(IHttpClientFactory httpFactory, AiSettingsStore ai, ILogge
         {
             options.Tools = tools;
             // 工具执行进度经 onEvent("status", …) 透出（前端 status 事件已有渲染，零协议改动）
-            (options.AdditionalProperties ??= [])[ToolLoopChatClient.StatusCallbackKey] =
+            var props = options.AdditionalProperties ??= [];
+            props[ToolLoopChatClient.StatusCallbackKey] =
                 new Func<string, Task>(t => onEvent?.Invoke(SseEvent.Status, t) ?? Task.CompletedTask);
+            // 留痕收集（调用方给了容器才挂）：与实时 status 并存，供落库重放
+            if (toolSteps != null)
+                props[ToolLoopChatClient.ToolStepsKey] = new Action<ToolLoopChatClient.ToolStep>(toolSteps.Add);
         }
         else if (UseJsonMode(s, model, thinking, jsonOutput))
             (options.AdditionalProperties ??= [])[JsonModeCapability.ResponseFormatKey] = "json_object";

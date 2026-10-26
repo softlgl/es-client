@@ -67,12 +67,11 @@ export async function renderAiChat(view, index) {
         <label class="chat-ctrl" title="开启后使用思考模型生成查询">
           <input type="checkbox" id="chat-thinking"> 思考模式
         </label>
-        <span class="tools-seg" title="AI 分步调用只读工具（临时查询/计数/采样）探索数据再收敛：关闭＝从不；自动＝按问题智能开启；强制＝每轮都探索">
+        <span class="tools-seg" title="AI 分步调用只读工具（临时查询/计数/采样）探索数据再收敛：关闭＝每问只查一次；自动＝按问题智能开启">
           工具探索
           <span class="seg" role="group">
             <button type="button" class="seg-btn" data-tools="off">关闭</button>
             <button type="button" class="seg-btn active" data-tools="auto">自动</button>
-            <button type="button" class="seg-btn" data-tools="force">强制</button>
           </span>
           <span class="tools-hint" id="chat-tools-hint"></span>
         </span>
@@ -101,25 +100,28 @@ export async function renderAiChat(view, index) {
   thinkCb.addEventListener('change', () =>
     localStorage.setItem('ai-thinking', thinkCb.checked ? '1' : '0'));
 
-  // 工具探索三态：off=从不；force=每轮都探索；auto=发送时按问题形态智能决定（默认）。
-  // 用显式分段控件取代“会自翻转的复选框”，模式与本轮预判都看得见、无隐性动作。
+  // 工具探索两态：off=从不；auto=发送时按问题形态智能决定（默认）。
+  // “强制（每轮都探索）”原为调试档、普通用户不会主动选，已移除；无隐性动作。
   let toolsMode = (() => {
     const raw = localStorage.getItem('ai-tools-mode');
-    if (raw === 'off' || raw === 'auto' || raw === 'force') return raw;
-    // 迁移旧版（auto/manual + boolean）：manual 固定过 → 按其末次值映射 force/off，否则 auto
-    return raw === 'manual' ? (localStorage.getItem('ai-tools') === '1' ? 'force' : 'off') : 'auto';
+    if (raw === 'off' || raw === 'auto') return raw;
+    // 迁移旧值：force（仅调试用）归入 auto；更早的 manual 固定过 → 按末次布尔值映射 auto/off
+    if (raw === 'force') return 'auto';
+    if (raw === 'manual') return localStorage.getItem('ai-tools') === '1' ? 'auto' : 'off';
+    return 'auto';
   })();
 
   // 规则分类（便宜的关键词/问题形态判断，不引入额外模型调用）：仅明显多步/探因/对比/下钻才默认开启，
-  // 简单计数/列举/TopN 一次查询即可 → 保持关闭，避免徒增延迟与 token。
+  // 简单计数/列举/TopN、以及「验证/核对」类（前置采样已在上下文给出）一律保持关闭。
+  // 误开工具的代价不只是延迟：带工具时 response_format json_object 会被关闭，DSL 解析稳定性下降。
   function looksExploratory(q) {
     if (!q) return false;
-    return /(为什么|为啥|原因|怎么回事|什么情况下|啥情况|对比|比较|相比|差异|区别|哪些.*(异常|问题|原因|慢)|哪几|哪个|哪一|异常|骤降|突增|飙升|波动|明显下降|下钻|细分|验证|核对|排查|先.+(再|然后|接着)|是不是因|是否因)/.test(q);
+    return /(为什么|为啥|原因|怎么回事|什么情况下|啥情况|对比|比较|相比|差异|区别|哪些.*(异常|问题|原因|慢)|哪几|哪个|哪一|异常|骤降|突增|飙升|波动|明显下降|下钻|细分|先.+(再|然后|接着)|是不是因|是否因)/.test(q);
   }
 
-  // 本轮实际是否下发工具：force 恒真、off 恒假、auto 看问题预判
+  // 本轮实际是否下发工具：off 恒假、auto 看问题预判
   function toolsEffective(q) {
-    return toolsMode === 'force' || (toolsMode === 'auto' && looksExploratory(q));
+    return toolsMode === 'auto' && looksExploratory(q);
   }
 
   function syncToolsUi() {
@@ -344,6 +346,29 @@ export async function renderAiChat(view, index) {
     } catch { toast('DSL 解析失败', true); }
   });
 
+  // 工具探索留痕：回答后保留为可折叠的「探索过程」，与流式期间的 🔧 status 一致但不占正文。
+  // steps 由后端随问答落库（历史重放）与 done 事件（本轮）一同回传；空则不渲染。
+  function toolStepsHtml(steps) {
+    if (!Array.isArray(steps) || steps.length === 0) return '';
+    const items = steps.map(s => {
+      const arg = escapeHtml(s.args || '{}');
+      const res = escapeHtml(s.result || (s.ok ? '' : '失败'));
+      return `<li><code class="cs-name">${escapeHtml(s.display || s.name || '')}</code>`
+        + `<code class="cs-args">${arg}</code>`
+        + `<span class="cs-arrow">→</span>`
+        + `<span class="cs-res ${s.ok ? '' : 'cs-fail'}">${res}</span>`
+        + (s.ms != null ? `<span class="cs-ms">${s.ms}ms</span>` : '') + '</li>';
+    }).join('');
+    return `<details class="chat-steps"><summary>🔧 探索过程 · ${steps.length} 步</summary><ol class="cs-list">${items}</ol></details>`;
+  }
+
+  // 思考过程（思考模式）：流式期间实时可见，回答完成后转进默认折叠的摘要区保留全文（随落库重放）。
+  // 后端存 8000 字符硬截断；这里再加 CSS 软上限，超长内部滚动、不撑爆气泡。
+  function reasoningHtml(text) {
+    if (!text) return '';
+    return `<details class="chat-reasoning-block"><summary>💭 思考过程</summary><pre class="cr-text">${escapeHtml(text)}</pre></details>`;
+  }
+
   function msgHtml(t) {
     if (t.role === 'user') {
       return `<div class="chat-msg user"><div class="chat-bubble">${escapeHtml(t.text)}</div></div>`;
@@ -354,6 +379,8 @@ export async function renderAiChat(view, index) {
           <div class="chat-answer">${escapeHtml(t.text)}</div>
           ${dataTableHtml(t.data)}
           ${openBrowseActionHtml(t.dsl)}
+          ${toolStepsHtml(t.steps)}
+          ${reasoningHtml(t.reasoning)}
           ${dslBlockHtml(t.dsl)}
         </div>
       </div>`;
@@ -423,6 +450,7 @@ export async function renderAiChat(view, index) {
     const dataEl = live.querySelector('.chat-data');
     const answerEl = live.querySelector('.chat-answer');
     let reasoningShown = false;
+    let reasoningText = '';   // 思考过程全文：完成后随 turns/done 渲染进折叠区，不再阅后即焚
     let dslText = null;
     let direct = false;   // 免查询直接回答：之后的 content 进回答气泡而非 DSL 预览
     let data = null;
@@ -455,7 +483,9 @@ export async function renderAiChat(view, index) {
             : `<span class="spinner"></span>${t}`;
         } else if (ev.type === 'reasoning') {
           if (!reasoningShown) { reasonEl.classList.remove('hidden'); reasoningShown = true; }
-          reasonEl.textContent += ev.text || '';
+          const chunk = ev.text || '';
+          reasoningText += chunk;
+          reasonEl.textContent += chunk;
           reasonEl.scrollTop = reasonEl.scrollHeight;
           autoScroll();
         } else if (ev.type === 'content' && !dslText && !direct) {
@@ -485,7 +515,7 @@ export async function renderAiChat(view, index) {
         } else if (ev.type === 'done') {
           const isNew = sessionId !== ev.sessionId;
           sessionId = ev.sessionId;
-          turns.push({ role: 'assistant', text: ev.turn.text, dsl: ev.turn.dsl, data: ev.turn.data });
+          turns.push({ role: 'assistant', text: ev.turn.text, dsl: ev.turn.dsl, data: ev.turn.data, steps: ev.turn.steps, reasoning: ev.turn.reasoning });
           await loadSessions();
           drawSessLabel();
           live.remove();
@@ -502,7 +532,7 @@ export async function renderAiChat(view, index) {
       if (settled) {
         if (answer.trim()) {
           // 流被意外截断但已有部分回答：保留为最终回答（服务端可能已落库，此处仅展示）
-          turns.push({ role: 'assistant', text: answer, dsl: dslText, data });
+          turns.push({ role: 'assistant', text: answer, dsl: dslText, data, reasoning: reasoningText });
           live.remove();
           drawMsgs();
           finish();

@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using EsClient.Api.Es;
 using EsClient.Api.Services;
+using EsClient.Api.Services.Chat;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.AI;
 
@@ -68,6 +69,8 @@ public class AiChatController : ControllerBase
     /// <summary>
     /// 提问（SSE 流式）。事件序列：reasoning* / content*（生成 DSL 阶段）→ dsl{dsl} →
     /// data{表格数据} → reasoning*/content*（总结阶段）→ done{sessionId,title,turn} 或 error{error}。
+    /// 生成阶段的 reasoning 除实时下发外另累积全文，随 done.turn.reasoning 回传并落库，
+    /// 前端回答完成后以折叠区保留（不再阅后即焚）。
     /// 与索引数据无关的问题（常识/观点/闲聊）在生成阶段以 {"no_query":true} 免查询，
     /// 事件序列为 content* → direct{} → content*（直接回答）→ done，不产生 dsl/data。
     /// </summary>
@@ -125,10 +128,15 @@ public class AiChatController : ControllerBase
             // 分步取数回路：开关打开时下发只读工具集，模型可先跑临时查询/采样验证口径再产出最终 DSL。
             // 工具均为后端只读操作，循环在服务端闭环完成，不需前端确认；写入类能力根本不注册。
             var tools = req.Tools == true ? AiTools.Build(client, index, meta, ct) : null;
+            // 本轮工具调用留痕（供落库、历史重放成折叠摘要）；多次 StreamAsync 共用同一列表累加。
+            var steps = new List<ToolLoopChatClient.ToolStep>();
+            // 生成阶段思考过程收集：此前 reasoning 只在流式期间实时可见、完成即销毁，
+            // 现在同步留一份全文随回答落库，重放时以折叠区展示
+            var reasoningSb = new System.Text.StringBuilder();
 
             // 第一次生成 DSL
             var content = await _aiClient.StreamAsync(messages, req.Thinking == true,
-                (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true, tools);
+                GenCallback(reasoningSb, ct), ct, jsonOutput: true, tools, steps);
             var (body, parseError) = AiDslGuard.ExtractSearchBody(content);
 
             // 常识/观点/闲聊等与索引数据无关的问题：模型标记免查询，直接回答。
@@ -148,16 +156,17 @@ public class AiChatController : ControllerBase
                     directAnswer = "（AI 未给出回答）";
 
                 var directNow = DateTimeOffset.Now;
+                var directReasoning = TruncateLong(reasoningSb.ToString(), MaxReasoningKeep);
                 var directSaved = await _chats.AddTurnsAsync(index, sessionId,
                 [
                     new ChatStore.ChatTurn("user", question, null, null, directNow),
-                    new ChatStore.ChatTurn("assistant", directAnswer, null, null, directNow)
+                    new ChatStore.ChatTurn("assistant", directAnswer, null, null, directNow, null, directReasoning)
                 ]);
                 await WriteSseAsync(SseEvent.Done, new
                 {
                     sessionId = directSaved.Id,
                     title = directSaved.Title,
-                    turn = new { role = "assistant", text = directAnswer, dsl = (string?)null, data = (JsonNode?)null, time = directNow }
+                    turn = new { role = "assistant", text = directAnswer, dsl = (string?)null, data = (JsonNode?)null, steps = (JsonNode?)null, reasoning = directReasoning, time = directNow }
                 }, ct);
                 return;
             }
@@ -173,7 +182,7 @@ public class AiChatController : ControllerBase
                     messages.Add(new ChatMessage(ChatRole.User,
                         $"上一次生成的 DSL 执行失败，错误信息：{execError}。请修正后重新输出，仍只输出一个 JSON 对象。"));
                     content = await _aiClient.StreamAsync(messages, req.Thinking == true,
-                        (type, text) => WriteSseAsync(type, new { text }, ct), ct, jsonOutput: true, tools);
+                        GenCallback(reasoningSb, ct), ct, jsonOutput: true, tools, steps);
                     (body, parseError) = AiDslGuard.ExtractSearchBody(content);
                     if (body == null) break; // 修正后仍解析不出可执行 DSL，交给下方收尾统一回告，避免解引用 null
                 }
@@ -220,19 +229,29 @@ public class AiChatController : ControllerBase
             if (string.IsNullOrWhiteSpace(answer))
                 answer = "（AI 未给出总结，请参考下方查询结果）";
 
-            // 落库：一问一答
+            // 工具探索留痕 → 落库形态（仅在真发生过工具调用时非空）
+            JsonNode? stepsNode = steps.Count > 0
+                ? new JsonArray(steps.Select(st => (JsonNode)new JsonObject
+                {
+                    ["name"] = st.Name, ["display"] = st.Display, ["args"] = st.Args,
+                    ["result"] = st.Result, ["ok"] = st.Ok, ["ms"] = st.ElapsedMs
+                }).ToArray())
+                : null;
+
+            // 落库：一问一答（reasoning 截断存全文，防思考长文撞会话文件体积上限）
+            var reasoning = TruncateLong(reasoningSb.ToString(), MaxReasoningKeep);
             var now = DateTimeOffset.Now;
             var saved = await _chats.AddTurnsAsync(index, sessionId,
             [
                 new ChatStore.ChatTurn("user", question, null, null, now),
-                new ChatStore.ChatTurn("assistant", answer, body!.ToJsonString(), tableData, now)
+                new ChatStore.ChatTurn("assistant", answer, body!.ToJsonString(), tableData, now, stepsNode, reasoning)
             ]);
 
             await WriteSseAsync(SseEvent.Done, new
             {
                 sessionId = saved.Id,
                 title = saved.Title,
-                turn = new { role = "assistant", text = answer, dsl = body.ToJsonString(), data = tableData, time = now }
+                turn = new { role = "assistant", text = answer, dsl = body.ToJsonString(), data = tableData, steps = stepsNode, reasoning, time = now }
             }, ct);
         }
         catch (Exception ex)
@@ -245,13 +264,32 @@ public class AiChatController : ControllerBase
 
     // ---------- 会话响应 ----------
 
+    /// <summary>落库/回传的思考过程全文上限（字符）：超长思考截断，防会话文件膨胀；前端另带软上限。</summary>
+    private const int MaxReasoningKeep = 8000;
+
+    /// <summary>
+    /// 生成阶段（含失败重试轮）的 SSE 回调：所有事件照常透传，同时把 reasoning 分叉一份进 sb
+    /// ——思考过程此前阅后即焚，现在需留全文供落库重放。（总结/直接回答不开思考，不收集。）
+    /// sb 由参数闭包捕获，每请求独立，不可提升为字段/静态（会跨请求串写）。
+    /// </summary>
+    private Func<string, string, Task> GenCallback(System.Text.StringBuilder sb, CancellationToken ct) =>
+        async (type, text) =>
+        {
+            if (type == SseEvent.Reasoning && text != null) sb.Append(text);
+            await WriteSseAsync(type, new { text }, ct);
+        };
+
+    /// <summary>空串→null，超长截断加省略号。</summary>
+    private static string? TruncateLong(string s, int max) =>
+        s.Length == 0 ? null : s.Length <= max ? s : s[..max] + "…";
+
     private static object ToClientSession(ChatStore.ChatSession s) => new
     {
         id = s.Id,
         title = s.Title,
         createdAt = s.CreatedAt,
         updatedAt = s.UpdatedAt,
-        turns = s.Turns.Select(t => new { role = t.Role, text = t.Text, dsl = t.Dsl, data = t.Data, time = t.Time })
+        turns = s.Turns.Select(t => new { role = t.Role, text = t.Text, dsl = t.Dsl, data = t.Data, steps = t.Steps, reasoning = t.Reasoning, time = t.Time })
     };
 
     

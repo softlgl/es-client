@@ -11,7 +11,10 @@ namespace EsClient.Api.Services;
 /// </summary>
 public class ChatStore
 {
-    public record ChatTurn(string Role, string Text, string? Dsl, JsonNode? Data, DateTimeOffset Time);
+    // Steps：本轮工具探索的结构化留痕（[{name,display,args,result,ok,ms}]），仅带工具且真调用时非空；
+    // Reasoning：生成阶段模型思考过程（思考模式）全文，落库后前端以折叠区重放；旧文件无这两个字段，默认 null 仍可反序列化（STJ 对缺失的可选构造参数取默认值）。
+    public record ChatTurn(string Role, string Text, string? Dsl, JsonNode? Data, DateTimeOffset Time,
+        JsonNode? Steps = null, string? Reasoning = null);
     public class ChatSession
     {
         public string Id { get; set; } = "";
