@@ -1,26 +1,22 @@
 import { get, post, toast } from '../api.js';
 import { escapeHtml, showModal, closeAllModals, modalRoot } from '../ui.js';
 
-// ---------- AI 模型配置对话框（OpenAI 兼容接口，全局唯一入口在顶栏 AI 下拉） ----------
-export function openAiSettingsDialog(onSaved) {
+// 配置有任何变化（保存/删除）都广播此事件，让顶栏等持有模型名副本的地方自行刷新
+export const AI_SETTINGS_CHANGED = 'ai-settings-changed';
+
+// ---------- AI 模型「新增/编辑」表单弹窗 ----------
+// 切换使用中、删除、选「哪一项」都在顶栏下拉完成；这里只编辑单个配置的表单字段。
+// existing 为要编辑的配置对象（含 id）；省略或传 null 即新增（密钥需完整填写）。
+export function openAiSettingsDialog(onSaved, existing) {
   get('/api/ai/settings').then(s => {
     const presets = s.presets || {};
-    const models = s.models || [];
-    let editingId = s.activeId || models[0]?.id || '';   // 当前编辑的配置；'' = 新增
+    const editingId = existing?.id || '';   // '' = 新增
+    const cur = existing || {};
 
     const presetOpts = Object.entries(presets).map(([k, p]) =>
       `<option value="${escapeHtml(k)}">${escapeHtml(p.label)}</option>`).join('');
-    const cfgOpts = '<option value="">＋ 新增配置…</option>' + models.map(m =>
-      `<option value="${escapeHtml(m.id)}" ${m.id === editingId ? 'selected' : ''}>${escapeHtml(m.model)}${m.id === s.activeId ? '（使用中）' : ''}</option>`).join('');
 
-    showModal('AI 设置（OpenAI 兼容接口）', `
-      <div class="field">
-        <label>模型配置</label>
-        <div class="ai-cfg-row">
-          <select id="ai-cfg-sel">${cfgOpts}</select>
-          <button class="btn" id="ai-cfg-del" ${models.length ? '' : 'disabled'}>删除</button>
-        </div>
-      </div>
+    showModal(editingId ? `编辑模型配置 — ${cur.model}` : '新增模型配置（OpenAI 兼容接口）', `
       <div class="field">
         <label>服务商</label>
         <select id="ai-provider">${presetOpts}</select>
@@ -57,14 +53,12 @@ export function openAiSettingsDialog(onSaved) {
       </div>`);
 
     const root = modalRoot;
-    const cfgSel = root.querySelector('#ai-cfg-sel');
     const provider = root.querySelector('#ai-provider');
     const url = root.querySelector('#ai-url');
     const key = root.querySelector('#ai-key');
     const model = root.querySelector('#ai-model');
     const tmodel = root.querySelector('#ai-tmodel');
     const jsonmode = root.querySelector('#ai-jsonmode');
-    const delBtn = root.querySelector('#ai-cfg-del');
 
     function fillForm(m) {
       provider.value = m?.provider ?? 'custom';
@@ -75,14 +69,8 @@ export function openAiSettingsDialog(onSaved) {
       model.value = m?.model ?? '';
       tmodel.value = m?.thinkingModel ?? '';
       jsonmode.value = m?.jsonMode == null ? '' : (m.jsonMode ? 'on' : 'off');
-      delBtn.disabled = !m;
     }
-    fillForm(models.find(m => m.id === editingId));
-
-    cfgSel.addEventListener('change', () => {
-      editingId = cfgSel.value;
-      fillForm(models.find(m => m.id === editingId));
-    });
+    fillForm(cur);
 
     provider.addEventListener('change', () => {
       const p = presets[provider.value];
@@ -94,16 +82,6 @@ export function openAiSettingsDialog(onSaved) {
     });
 
     root.querySelector('#ai-cancel').addEventListener('click', closeAllModals);
-    delBtn.addEventListener('click', async () => {
-      if (!editingId || !confirm('确定删除该模型配置？')) return;
-      try {
-        await post('/api/ai/settings/delete', { id: editingId });
-        toast('已删除');
-        openAiSettingsDialog(onSaved);   // 重新加载列表
-      } catch (e) {
-        toast(e.message, true);
-      }
-    });
 
     root.querySelector('#ai-save').addEventListener('click', async () => {
       const btn = root.querySelector('#ai-save');
@@ -122,6 +100,7 @@ export function openAiSettingsDialog(onSaved) {
         if (!editingId) await post('/api/ai/settings/switch', { id: r.id }).catch(() => {});
         toast('AI 设置已保存');
         closeAllModals();
+        window.dispatchEvent(new Event(AI_SETTINGS_CHANGED));
         if (onSaved) onSaved();
       } catch (e) {
         toast(e.message, true);
@@ -129,6 +108,36 @@ export function openAiSettingsDialog(onSaved) {
       }
     });
 
-    key.focus();
+    if (!editingId) key.focus();
   }).catch(e => toast(e.message, true));
+}
+
+// ---------- 删除模型配置确认窗（与删除索引同风格的破坏性操作预警） ----------
+// m 为顶栏下拉里点击删除的那一项（含 id / model）；isActive 标识其是否为使用中项；
+// onDeleted 在删除成功后回调（用于就地刷新列表）
+export function confirmDeleteAiModel(m, isActive, onDeleted) {
+  showModal('删除模型配置', `
+    <div class="del-confirm">
+      <p class="del-warn">将删除模型配置 <code>${escapeHtml(m.model)}</code>，该操作不可恢复。</p>
+      ${isActive ? '<p class="del-warn" style="color:#d9534f">这是当前使用中的模型，删除后将自动切换到其余配置。</p>' : ''}
+      <div class="del-actions">
+        <button class="btn" id="del-cancel">取消</button>
+        <button class="btn btn-danger" id="del-ok">确认删除</button>
+      </div>
+    </div>`);
+  const ok = modalRoot.querySelector('#del-ok');
+  modalRoot.querySelector('#del-cancel').addEventListener('click', closeAllModals);
+  ok.addEventListener('click', async () => {
+    ok.disabled = true;
+    try {
+      await post('/api/ai/settings/delete', { id: m.id });
+      closeAllModals();
+      toast('已删除');
+      window.dispatchEvent(new Event(AI_SETTINGS_CHANGED));
+      if (onDeleted) onDeleted();
+    } catch (e) {
+      toast(e.message, true);
+      ok.disabled = false;
+    }
+  });
 }

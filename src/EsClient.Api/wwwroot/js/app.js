@@ -5,7 +5,7 @@ import { openConnectModal } from './views/connect.js';
 import { renderIndices, confirmDeleteIndex } from './views/indices.js';
 import { renderBrowse, clearBrowseCache } from './views/browse.js';
 import { renderAiChat } from './views/ai-chat.js';
-import { openAiSettingsDialog } from './views/ai-settings.js';
+import { openAiSettingsDialog, confirmDeleteAiModel, AI_SETTINGS_CHANGED } from './views/ai-settings.js';
 
 const view = document.getElementById('view');
 
@@ -146,6 +146,55 @@ async function refreshAiLabel() {
   } catch { aiLabel.textContent = '✨ AI 未配置'; }
 }
 
+const AI_SVG_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+const AI_SVG_DEL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>';
+
+// 渲染顶栏 AI 下拉：每行 = 模型名 + 使用中徽标 + hover 显示的编辑/删除图标
+// 点行切换使用中；行内的 ✎ 开编辑表单、🗑 弹删除确认（对齐连接菜单的范式）
+function renderAiMenu(s) {
+  const models = s.models || [];
+  aiMenu.innerHTML = (models.map(m => `
+    <div class="conn-item" data-ai-id="${escapeHtml(m.id)}" title="点击切换为使用中">
+      <span class="ai-item-name">${escapeHtml(m.model)}</span>
+      ${m.id === s.activeId ? '<span class="ai-active">使用中</span>' : ''}
+      <span class="ci-acts">
+        <button class="conn-edit" data-ai-edit="${escapeHtml(m.id)}" title="编辑该配置">${AI_SVG_EDIT}</button>
+        <button class="conn-del" data-ai-del="${escapeHtml(m.id)}" title="删除该配置">${AI_SVG_DEL}</button>
+      </span>
+    </div>`).join('') || '<div class="conn-item ai-menu-hint">尚未配置模型</div>')
+    + `<div class="ai-menu-divider"></div>
+       <div class="conn-item" id="ai-add">＋ 新增模型配置…</div>`;
+
+  aiMenu.querySelectorAll('[data-ai-id]').forEach(el => el.addEventListener('click', async e => {
+    if (e.target.closest('button')) return;   // 编辑/删除按钮各自处理，不触发切换
+    try {
+      await post('/api/ai/settings/switch', { id: el.dataset.aiId });
+      toast('已切换模型');
+      closeAiMenu();
+      refreshAiLabel();
+    } catch (err) { toast(err.message, true); }
+  }));
+  aiMenu.querySelectorAll('[data-ai-edit]').forEach(el => el.addEventListener('click', e => {
+    e.stopPropagation();
+    const m = models.find(x => x.id === el.dataset.aiEdit);
+    if (!m) return;
+    closeAiMenu();
+    openAiSettingsDialog(refreshAiLabel, m);   // 编辑已有配置
+  }));
+  aiMenu.querySelectorAll('[data-ai-del]').forEach(el => el.addEventListener('click', e => {
+    e.stopPropagation();
+    const m = models.find(x => x.id === el.dataset.aiDel);
+    if (!m) return;
+    // 删除与切换对齐：确认弹窗关闭后菜单也收起（菜单内不在 aiDd，确认点击会触发全局 closeAiMenu）；
+    // 顶栏标签由 AI_SETTINGS_CHANGED 事件刷新，下次展开菜单自然取到最新列表
+    confirmDeleteAiModel(m, m.id === s.activeId, () => closeAiMenu());
+  }));
+  aiMenu.querySelector('#ai-add').addEventListener('click', () => {
+    closeAiMenu();
+    openAiSettingsDialog(refreshAiLabel, null);   // 新增配置
+  });
+}
+
 aiLabel.addEventListener('click', async e => {
   e.stopPropagation();
   if (!aiMenu.classList.contains('hidden')) { closeAiMenu(); return; }
@@ -153,27 +202,7 @@ aiLabel.addEventListener('click', async e => {
   aiMenu.innerHTML = '<div class="conn-item">加载中…</div>';
   aiMenu.classList.remove('hidden');
   try {
-    const s = await get('/api/ai/settings');
-    const models = s.models || [];
-    aiMenu.innerHTML = (models.map(m => `
-      <div class="conn-item" data-ai-id="${escapeHtml(m.id)}">
-        <span class="ai-item-name">${escapeHtml(m.model)}</span>
-        ${m.id === s.activeId ? '<span class="ai-active">使用中</span>' : ''}
-      </div>`).join('') || '<div class="conn-item ai-menu-hint">尚未配置模型</div>')
-      + `<div class="ai-menu-divider"></div>
-         <div class="conn-item" id="ai-manage">⚙ 管理模型配置…</div>`;
-    aiMenu.querySelectorAll('[data-ai-id]').forEach(el => el.addEventListener('click', async () => {
-      try {
-        await post('/api/ai/settings/switch', { id: el.dataset.aiId });
-        toast('已切换模型');
-        closeAiMenu();
-        refreshAiLabel();
-      } catch (err) { toast(err.message, true); }
-    }));
-    aiMenu.querySelector('#ai-manage').addEventListener('click', () => {
-      closeAiMenu();
-      openAiSettingsDialog(refreshAiLabel);
-    });
+    renderAiMenu(await get('/api/ai/settings'));
   } catch (err) {
     aiMenu.innerHTML = `<div class="conn-item ai-menu-hint">${escapeHtml(err.message)}</div>`;
   }
@@ -181,6 +210,8 @@ aiLabel.addEventListener('click', async e => {
 document.addEventListener('click', e => {
   if (!aiDd.contains(e.target)) closeAiMenu();
 });
+// 模型配置在弹窗里被保存/删除后同步顶栏名称（删除的往往正是使用中那一项）
+window.addEventListener(AI_SETTINGS_CHANGED, refreshAiLabel);
 refreshAiLabel();
 
 // ---------- 侧栏宽度（可拖拽） ----------

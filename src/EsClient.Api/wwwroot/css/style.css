@@ -91,12 +91,15 @@ body {
 #ai-label:hover, .ai-dropdown:has(#ai-menu:not(.hidden)) #ai-label {
   border-color: var(--primary); box-shadow: 0 1px 4px rgba(15, 35, 60, .10); color: var(--text);
 }
-.ai-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-active {
   flex-shrink: 0; margin-left: auto; padding: 0 6px; border-radius: 4px;
   background: #e7f5ec; color: #116329; font-size: 11px; line-height: 18px;
 }
-.ai-menu { width: 300px; }
+.ai-menu { width: 300px; left: auto; right: 0; }   /* 右对齐向左展开：AI 标签贴右上角，否则菜单会冲出视口右缘、行内图标被裁掉 */
+/* AI 下拉的编辑/删除图标常驻显示（平时略淡、悬停加深）：删除这类操作不该靠 hover 才能发现 */
+.ai-menu .ci-acts { opacity: .55; }
+.ai-menu .conn-item:hover .ci-acts { opacity: 1; }
 .ai-menu-divider { height: 1px; background: var(--border); margin: 5px 4px; }
 .ai-menu-hint { color: var(--muted); cursor: default; }
 .ai-menu-hint:hover { background: transparent; }
@@ -170,8 +173,6 @@ body {
   padding: 3px 6px; font-size: 12px;
   border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
 }
-.ai-cfg-row { display: flex; gap: 8px; }
-.ai-cfg-row select { flex: 1; }
 .ai-turn-actions { display: flex; gap: 8px; }
 .ai-turn-actions .btn { padding: 4px 14px; font-size: 12px; }
 /* 流式生成：思考过程（灰底斜体）+ 生成中的内容 */
