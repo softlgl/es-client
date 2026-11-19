@@ -77,7 +77,7 @@ dotnet run --project src/Seeder -- --host http://localhost:9200 --count 120000
 
 - `connections.json`：ES 连接（含用户名/密码）
 - `ai-settings.json`：AI 模型配置（含 ApiKey）
-- `chats/`：AI 问答会话历史（按索引分文件）
+- `chat.db`：AI 问答会话历史（SQLite，首次访问时自动创建；旧版 `chats/*.json` 会在首次启动时自动迁移并归档为 `*.imported`）
 
 > ⚠️ 该目录包含明文凭据，请勿分享给他人。
 

@@ -44,7 +44,7 @@ public class AiChatController : ControllerBase
         var sessions = await _chats.ListAsync(index);
         return Ok(new
         {
-            sessions = sessions.Select(s => new { id = s.Id, title = s.Title, updatedAt = s.UpdatedAt, turns = s.Turns.Count })
+            sessions = sessions.Select(s => new { id = s.Id, title = s.Title, updatedAt = s.UpdatedAt, turns = s.TurnCount })
         });
     }
 
